@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Thor Display Swapper</string>
+    <string name="accessibility_service_description">Двойное «Назад» — обмен/перенос. Долгое «Назад» — активное на другой экран. Долгий AYN — список приложений. Долгий Home — свернуть всё. Требуется Wireless ADB.</string>
+    <string name="notification_channel_name">Служба обмена экранами</string>
+    <string name="notification_title">Thor Display Swapper</string>
+    <string name="notification_text">2×Назад — обмен · долгий AYN — список приложений · долгий Home — свернуть</string>
+</resources>
