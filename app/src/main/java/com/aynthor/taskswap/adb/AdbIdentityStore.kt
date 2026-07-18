@@ -6,16 +6,16 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
-import android.util.Base64
 import android.util.Log
-import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.util.Base64
 
 /**
- * Persists Wireless ADB pairing identity outside app-private storage so it survives
- * uninstall / reinstall. Prefer `adb install -r` so SharedPreferences are kept;
- * this backup is the safety net when a full uninstall happens.
+ * Persists Wireless ADB pairing identity so it survives process death and debug reinstalls.
+ *
+ * Priority (load): app filesDir → MediaStore Documents → public dir → app external files.
+ * SharedPreferences cert/key are handled separately by [AdbConnectionManager] (best for `adb install -r`).
  */
 object AdbIdentityStore {
 
@@ -31,6 +31,50 @@ object AdbIdentityStore {
         val keyPem: String?
     )
 
+    fun encode(
+        paired: Boolean,
+        connectionPort: Int?,
+        cert: ByteArray?,
+        key: ByteArray?
+    ): ByteArray {
+        val certJson = cert?.let { "\"${Base64.getEncoder().encodeToString(it)}\"" } ?: "null"
+        val keyJson = key?.let { "\"${Base64.getEncoder().encodeToString(it)}\"" } ?: "null"
+        return """{"paired":$paired,"connectionPort":${connectionPort ?: -1},"cert":$certJson,"key":$keyJson}"""
+            .toByteArray(Charsets.UTF_8)
+    }
+
+    fun parse(bytes: ByteArray): Backup? = runCatching {
+        val text = bytes.toString(Charsets.UTF_8)
+        Backup(
+            paired = readBoolean(text, "paired") ?: false,
+            connectionPort = readInt(text, "connectionPort")?.takeIf { it > 0 },
+            certPem = readString(text, "cert"),
+            keyPem = readString(text, "key")
+        )
+    }.onFailure {
+        Log.w(TAG, "Failed to parse ADB identity: ${it.message}")
+    }.getOrNull()
+
+    private fun readBoolean(json: String, key: String): Boolean? {
+        val match = Regex("\"$key\"\\s*:\\s*(true|false)").find(json) ?: return null
+        return match.groupValues[1].toBoolean()
+    }
+
+    private fun readInt(json: String, key: String): Int? {
+        val match = Regex("\"$key\"\\s*:\\s*(-?\\d+)").find(json) ?: return null
+        return match.groupValues[1].toIntOrNull()
+    }
+
+    private fun readString(json: String, key: String): String? {
+        val nullMatch = Regex("\"$key\"\\s*:\\s*null").find(json)
+        val stringMatch = Regex("\"$key\"\\s*:\\s*\"([^\"]*)\"").find(json)
+        if (nullMatch != null && (stringMatch == null || nullMatch.range.first < stringMatch.range.first)) {
+            return null
+        }
+        val value = stringMatch?.groupValues?.get(1) ?: return null
+        return value.takeIf { it.isNotBlank() && it != "null" }
+    }
+
     fun save(
         context: Context,
         paired: Boolean,
@@ -38,46 +82,50 @@ object AdbIdentityStore {
         cert: ByteArray?,
         key: ByteArray?
     ) {
-        val payload = JSONObject()
-            .put("paired", paired)
-            .put("connectionPort", connectionPort ?: -1)
-            .put("cert", cert?.let { Base64.encodeToString(it, Base64.NO_WRAP) })
-            .put("key", key?.let { Base64.encodeToString(it, Base64.NO_WRAP) })
-            .toString()
-            .toByteArray(Charsets.UTF_8)
-
+        val payload = encode(paired, connectionPort, cert, key)
+        val okInternal = saveViaInternal(context, payload)
         val okMedia = saveViaMediaStore(context, payload)
         val okFile = saveViaPublicFile(payload)
         val okApp = saveViaAppExternal(context, payload)
-        Log.i(TAG, "ADB identity save media=$okMedia file=$okFile appExt=$okApp")
+        Log.i(TAG, "ADB identity save internal=$okInternal media=$okMedia file=$okFile appExt=$okApp")
     }
 
     fun load(context: Context): Backup? {
-        val bytes = loadViaMediaStore(context)
+        val bytes = loadViaInternal(context)
+            ?: loadViaMediaStore(context)
             ?: loadViaPublicFile()
             ?: loadViaAppExternal(context)
             ?: return null
-        return runCatching {
-            val json = JSONObject(bytes.toString(Charsets.UTF_8))
-            Backup(
-                paired = json.optBoolean("paired", false),
-                connectionPort = json.optInt("connectionPort", -1).takeIf { it > 0 },
-                certPem = json.optString("cert").takeIf { it.isNotBlank() && it != "null" },
-                keyPem = json.optString("key").takeIf { it.isNotBlank() && it != "null" }
-            )
-        }.onFailure {
-            Log.w(TAG, "Failed to parse ADB identity: ${it.message}")
-        }.getOrNull()
+        return parse(bytes)
     }
 
     fun decodePem(base64: String): ByteArray =
-        Base64.decode(base64, Base64.NO_WRAP)
+        Base64.getDecoder().decode(base64)
+
+    private fun internalFile(context: Context): File =
+        File(context.filesDir, FILE_NAME)
+
+    private fun saveViaInternal(context: Context, payload: ByteArray): Boolean {
+        return runCatching {
+            FileOutputStream(internalFile(context)).use { it.write(payload) }
+            true
+        }.onFailure {
+            Log.w(TAG, "Internal save failed: ${it.message}")
+        }.getOrDefault(false)
+    }
+
+    private fun loadViaInternal(context: Context): ByteArray? {
+        return runCatching {
+            val file = internalFile(context)
+            if (!file.isFile) return null
+            file.readBytes()
+        }.getOrNull()
+    }
 
     private fun saveViaMediaStore(context: Context, payload: ByteArray): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
         return runCatching {
             val resolver = context.contentResolver
-            // Update existing if present
             findMediaUri(context)?.let { uri ->
                 resolver.openOutputStream(uri, "wt")?.use { it.write(payload) }
                 return@runCatching true

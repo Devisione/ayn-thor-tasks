@@ -23,25 +23,33 @@ class ButtonGesturesTest {
     }
 
     @Test
-    fun ayn_longPress_opensAllAppsList() {
+    fun ayn_longPress_emitsAynLongSlot() {
         val g = ButtonGestures()
         g.onKeyEvent(ButtonGestures.Key.AYN, ButtonGestures.KeyAction.DOWN, 0)
         val timeout = g.onAynHoldTimeout()
         assertTrue(timeout.consume)
-        assertEquals(listOf(ButtonGestures.Action.OpenAllAppsList), timeout.actions)
+        assertEquals(
+            listOf(ButtonGestures.Action.Custom(GestureSettings.Slot.AYN_LONG)),
+            timeout.actions
+        )
         val up = g.onKeyEvent(ButtonGestures.Key.AYN, ButtonGestures.KeyAction.UP, 1100)
         assertTrue(up.consume)
         assertEquals(emptyList<ButtonGestures.Action>(), up.actions)
     }
 
     @Test
-    fun ayn_doubleTap_doesNothingCustom() {
+    fun ayn_doubleTap_emitsAynDoubleSlot() {
         val g = ButtonGestures()
         g.onKeyEvent(ButtonGestures.Key.AYN, ButtonGestures.KeyAction.DOWN, 0)
         g.onKeyEvent(ButtonGestures.Key.AYN, ButtonGestures.KeyAction.UP, 30)
         val secondDown = g.onKeyEvent(ButtonGestures.Key.AYN, ButtonGestures.KeyAction.DOWN, 120)
         assertTrue(secondDown.consume)
         assertTrue(secondDown.actions.isEmpty())
+        val secondUp = g.onKeyEvent(ButtonGestures.Key.AYN, ButtonGestures.KeyAction.UP, 160)
+        assertEquals(
+            listOf(ButtonGestures.Action.Custom(GestureSettings.Slot.AYN_DOUBLE)),
+            secondUp.actions
+        )
     }
 
     @Test
@@ -61,11 +69,14 @@ class ButtonGesturesTest {
     }
 
     @Test
-    fun home_longPress_minimize_notOnUp() {
+    fun home_longPress_emitsHomeLongSlot_notOnUp() {
         val g = ButtonGestures()
         g.onKeyEvent(ButtonGestures.Key.HOME, ButtonGestures.KeyAction.DOWN, 0)
         val timeout = g.onHomeHoldTimeout()
-        assertEquals(listOf(ButtonGestures.Action.MinimizeAllDisplays), timeout.actions)
+        assertEquals(
+            listOf(ButtonGestures.Action.Custom(GestureSettings.Slot.HOME_LONG)),
+            timeout.actions
+        )
         val up = g.onKeyEvent(ButtonGestures.Key.HOME, ButtonGestures.KeyAction.UP, 1200)
         assertTrue(up.actions.isEmpty())
     }
@@ -75,7 +86,7 @@ class ButtonGesturesTest {
         val g = ButtonGestures()
         g.onKeyEvent(ButtonGestures.Key.HOME, ButtonGestures.KeyAction.DOWN, 0)
         assertEquals(
-            listOf(ButtonGestures.Action.MinimizeAllDisplays),
+            listOf(ButtonGestures.Action.Custom(GestureSettings.Slot.HOME_LONG)),
             g.onHomeHoldTimeout().actions
         )
         assertTrue(g.isHomeLongFired())
@@ -94,13 +105,16 @@ class ButtonGesturesTest {
     }
 
     @Test
-    fun back_doubleTap_swaps() {
+    fun back_doubleTap_emitsBackDoubleSlot() {
         val g = ButtonGestures()
         g.onKeyEvent(ButtonGestures.Key.BACK, ButtonGestures.KeyAction.DOWN, 0)
         g.onKeyEvent(ButtonGestures.Key.BACK, ButtonGestures.KeyAction.UP, 10)
         g.onKeyEvent(ButtonGestures.Key.BACK, ButtonGestures.KeyAction.DOWN, 100)
         val d = g.onKeyEvent(ButtonGestures.Key.BACK, ButtonGestures.KeyAction.UP, 120)
-        assertEquals(listOf(ButtonGestures.Action.SwapDisplaysOrSendSingle), d.actions)
+        assertEquals(
+            listOf(ButtonGestures.Action.Custom(GestureSettings.Slot.BACK_DOUBLE)),
+            d.actions
+        )
     }
 
     @Test
@@ -113,11 +127,14 @@ class ButtonGesturesTest {
     }
 
     @Test
-    fun regression_backLong_isNeverMinimizeAll() {
+    fun regression_backLong_emitsBackLongSlot_notMinimize() {
         val g = ButtonGestures()
         g.onKeyEvent(ButtonGestures.Key.BACK, ButtonGestures.KeyAction.DOWN, 0)
         val timeout = g.onBackHoldTimeout()
-        assertEquals(listOf(ButtonGestures.Action.PushActiveToOtherDisplay), timeout.actions)
+        assertEquals(
+            listOf(ButtonGestures.Action.Custom(GestureSettings.Slot.BACK_LONG)),
+            timeout.actions
+        )
         assertTrue(timeout.actions.none { it is ButtonGestures.Action.MinimizeAllDisplays })
     }
 
@@ -127,5 +144,29 @@ class ButtonGesturesTest {
         assertTrue(g.onKeyEvent(ButtonGestures.Key.AYN, ButtonGestures.KeyAction.DOWN, 0).consume)
         assertTrue(g.onKeyEvent(ButtonGestures.Key.HOME, ButtonGestures.KeyAction.DOWN, 0).consume)
         assertTrue(g.onKeyEvent(ButtonGestures.Key.BACK, ButtonGestures.KeyAction.DOWN, 0).consume)
+    }
+
+    @Test
+    fun defaultSlots_resolveToLegacyActions() {
+        assertEquals(
+            ButtonGestures.Action.SwapDisplaysOrSendSingle,
+            GestureSettings.defaultAction(GestureSettings.Slot.BACK_DOUBLE).toButtonAction()
+        )
+        assertEquals(
+            ButtonGestures.Action.PushActiveToOtherDisplay,
+            GestureSettings.defaultAction(GestureSettings.Slot.BACK_LONG).toButtonAction()
+        )
+        assertEquals(
+            ButtonGestures.Action.MinimizeAllDisplays,
+            GestureSettings.defaultAction(GestureSettings.Slot.HOME_LONG).toButtonAction()
+        )
+        assertEquals(
+            null,
+            GestureSettings.defaultAction(GestureSettings.Slot.AYN_DOUBLE).toButtonAction()
+        )
+        assertEquals(
+            ButtonGestures.Action.OpenAllAppsList,
+            GestureSettings.defaultAction(GestureSettings.Slot.AYN_LONG).toButtonAction()
+        )
     }
 }

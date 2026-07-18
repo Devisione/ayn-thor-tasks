@@ -3,8 +3,8 @@ package com.aynthor.taskswap.input
 /**
  * Pure button gesture interpreter.
  *
- * AYN long (1s) → system all-apps list. Home must NEVER open that list.
- * Home has no double-tap action.
+ * Configurable double/long slots emit [Action.Custom]; short presses stay system.
+ * Home has no double-tap slot.
  */
 class ButtonGestures(
     private val holdThresholdMs: Long = 1000L,
@@ -20,6 +20,8 @@ class ButtonGestures(
         data object MinimizeAllDisplays : Action()
         data object SwapDisplaysOrSendSingle : Action()
         data object PushActiveToOtherDisplay : Action()
+        /** User-configurable slot; resolved via [GestureSettings]. */
+        data class Custom(val slot: GestureSettings.Slot) : Action()
     }
 
     data class Decision(
@@ -53,7 +55,7 @@ class ButtonGestures(
         if (backDownAt < 0L || backLongFired) return Decision(consume = false)
         backLongFired = true
         backPendingSingle = false
-        return Decision(consume = true, actions = listOf(Action.PushActiveToOtherDisplay))
+        return Decision(consume = true, actions = listOf(Action.Custom(GestureSettings.Slot.BACK_LONG)))
     }
 
     fun onHomeHoldTimeout(): Decision {
@@ -62,7 +64,7 @@ class ButtonGestures(
         homePendingSingle = false
         return Decision(
             consume = true,
-            actions = listOf(Action.MinimizeAllDisplays),
+            actions = listOf(Action.Custom(GestureSettings.Slot.HOME_LONG)),
             cancelHomeSystemInject = true
         )
     }
@@ -73,7 +75,7 @@ class ButtonGestures(
         aynPendingSingle = false
         return Decision(
             consume = true,
-            actions = listOf(Action.OpenAllAppsList),
+            actions = listOf(Action.Custom(GestureSettings.Slot.AYN_LONG)),
             cancelAynSystemInject = true
         )
     }
@@ -127,7 +129,10 @@ class ButtonGestures(
                 }
                 if (backPendingSingle) {
                     backPendingSingle = false
-                    return Decision(consume = true, actions = listOf(Action.SwapDisplaysOrSendSingle))
+                    return Decision(
+                        consume = true,
+                        actions = listOf(Action.Custom(GestureSettings.Slot.BACK_DOUBLE))
+                    )
                 }
                 backPendingSingle = true
                 Decision(consume = true, armBackSingleTimeout = true)
@@ -165,7 +170,6 @@ class ButtonGestures(
             KeyAction.DOWN -> {
                 // Always consume DOWN — otherwise Thor firmware dims/turns off the bottom screen.
                 if (aynPendingSingle) {
-                    // Double tap: ignore custom UI (list is long-press only). Consume only.
                     aynPendingSingle = false
                     aynDoubleHandled = true
                     aynDownAt = t
@@ -188,7 +192,11 @@ class ButtonGestures(
                 }
                 if (aynDoubleHandled) {
                     aynDoubleHandled = false
-                    return Decision(consume = true, cancelAynSystemInject = true)
+                    return Decision(
+                        consume = true,
+                        actions = listOf(Action.Custom(GestureSettings.Slot.AYN_DOUBLE)),
+                        cancelAynSystemInject = true
+                    )
                 }
                 aynPendingSingle = true
                 Decision(consume = true)

@@ -6,20 +6,27 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Contract: long AYN opens the system ALL-APPS list ("список приложений").
+ * Contract: long AYN opens the system ALL-APPS list ("список приложений") by default.
  */
 class AynGestureContractTest {
 
     @Test
-    fun ayn_longPress_opensAllAppsList() {
+    fun ayn_longPress_emitsAynLongSlot_defaultResolvesToAllApps() {
         val g = ButtonGestures()
         g.onKeyEvent(ButtonGestures.Key.AYN, ButtonGestures.KeyAction.DOWN, 0)
         val timeout = g.onAynHoldTimeout()
         assertEquals(
-            listOf(ButtonGestures.Action.OpenAllAppsList),
+            listOf(ButtonGestures.Action.Custom(GestureSettings.Slot.AYN_LONG)),
             timeout.actions
         )
-        assertFalse(timeout.actions.any { it is ButtonGestures.Action.MinimizeAllDisplays })
+        assertEquals(
+            ButtonGestures.Action.OpenAllAppsList,
+            GestureSettings.defaultAction(GestureSettings.Slot.AYN_LONG).toButtonAction()
+        )
+        assertFalse(
+            GestureSettings.defaultAction(GestureSettings.Slot.AYN_LONG).toButtonAction()
+                is ButtonGestures.Action.MinimizeAllDisplays
+        )
     }
 
     @Test

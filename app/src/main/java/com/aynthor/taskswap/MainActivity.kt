@@ -7,10 +7,8 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -35,9 +33,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.aynthor.taskswap.adb.AdbConnectionManager
+import com.aynthor.taskswap.input.GestureSettings
 import com.aynthor.taskswap.task.DisplaySwapper
 import com.aynthor.taskswap.ui.AppTextField
 import com.aynthor.taskswap.ui.BannerType
+import com.aynthor.taskswap.ui.GestureSettingsPanel
 import com.aynthor.taskswap.ui.SetupGuide
 import com.aynthor.taskswap.ui.SetupStatus
 import com.aynthor.taskswap.ui.StatusBanner
@@ -90,6 +90,13 @@ fun MainScreen() {
     var pairingCode by remember { mutableStateOf("") }
     var connectionPort by remember { mutableStateOf(AdbConnectionManager.savedConnectionPort()?.toString() ?: "") }
 
+    var gesturesEnabled by remember { mutableStateOf(GestureSettings.isEnabled(context)) }
+    var gestureActions by remember {
+        mutableStateOf(
+            GestureSettings.Slot.entries.associateWith { GestureSettings.getAction(context, it) }
+        )
+    }
+
     fun showStatus(message: String, type: BannerType) {
         statusMessage = message
         bannerType = type
@@ -108,6 +115,22 @@ fun MainScreen() {
 
     LaunchedEffect(Unit) {
         AdbConnectionManager.state.collectLatest { adbState = it }
+    }
+
+    // After debug reinstall / process restart: restore identity already ran in init();
+    // reconnect with the saved port so the user does not re-enter ADB setup.
+    LaunchedEffect(Unit) {
+        if (!AdbConnectionManager.isPaired()) return@LaunchedEffect
+        val port = AdbConnectionManager.savedConnectionPort() ?: return@LaunchedEffect
+        if (AdbConnectionManager.state.value == AdbConnectionManager.State.CONNECTED) return@LaunchedEffect
+        connectionPort = port.toString()
+        isConnecting = true
+        val result = AdbConnectionManager.reconnect()
+        isConnecting = false
+        if (result.isSuccess) {
+            adbPaired = true
+            showStatus("ADB подключён (восстановлено)", BannerType.SUCCESS)
+        }
     }
 
     LaunchedEffect(Unit) {
@@ -248,7 +271,19 @@ fun MainScreen() {
                 }
             )
         } else {
-            ReadyBanner()
+            ReadyBanner(gesturesEnabled = gesturesEnabled)
+            GestureSettingsPanel(
+                enabled = gesturesEnabled,
+                onEnabledChange = { enabled ->
+                    gesturesEnabled = enabled
+                    GestureSettings.setEnabled(context, enabled)
+                },
+                actions = gestureActions,
+                onActionChange = { slot, action ->
+                    gestureActions = gestureActions + (slot to action)
+                    GestureSettings.setAction(context, slot, action)
+                }
+            )
             StatusCard(
                 serviceRunning = serviceRunning,
                 adbState = adbState,
@@ -323,14 +358,12 @@ fun MainScreen() {
                 Text("Последняя кнопка: $lastKeyDebug", style = MaterialTheme.typography.labelSmall)
             }
 
-            Spacer(modifier = Modifier.height(8.dp))
-            ShortcutsHelp()
         }
     }
 }
 
 @Composable
-private fun ReadyBanner() {
+private fun ReadyBanner(gesturesEnabled: Boolean) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
@@ -345,7 +378,11 @@ private fun ReadyBanner() {
                 fontWeight = FontWeight.Bold
             )
             Text(
-                "Двойное «Назад» — обмен/перенос. Долгий AYN — список приложений. Долгий Home — свернуть всё.",
+                if (gesturesEnabled) {
+                    "Жесты включены — настройте действия кнопок ниже."
+                } else {
+                    "Жесты выключены — кнопки работают как в системе."
+                },
                 style = MaterialTheme.typography.bodySmall
             )
         }
@@ -391,51 +428,6 @@ private fun ReconnectSection(
             }
         }
     }
-}
-
-@Composable
-private fun ShortcutsHelp() {
-    Text("Управление кнопкой «Назад»", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-    Text("Короткое нажатие → назад", style = MaterialTheme.typography.bodySmall)
-    Text(
-        "Двойное нажатие → обмен или перенос на другой экран (работает и с одним приложением)",
-        style = MaterialTheme.typography.bodySmall,
-        fontWeight = FontWeight.Medium
-    )
-    Text(
-        "Долгое нажатие (1 сек) → активное приложение на другой экран; на исходном — лаунчер",
-        style = MaterialTheme.typography.bodySmall,
-        fontWeight = FontWeight.Medium
-    )
-
-    Spacer(modifier = Modifier.height(8.dp))
-
-    Text("Управление кнопкой «Home»", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-    Text("Короткое нажатие → обычный Home", style = MaterialTheme.typography.bodySmall)
-    Text(
-        "Долгое нажатие (1 сек) → свернуть все приложения на всех экранах",
-        style = MaterialTheme.typography.bodySmall,
-        fontWeight = FontWeight.Medium
-    )
-    Text("Двойной Home ничего специального не делает", style = MaterialTheme.typography.bodySmall)
-
-    Spacer(modifier = Modifier.height(8.dp))
-
-    Text("Управление кнопкой «AYN»", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-    Text("Короткое нажатие → системное меню (как обычно)", style = MaterialTheme.typography.bodySmall)
-    Text(
-        "Долгое нажатие (1 сек) → список приложений (все приложения)",
-        style = MaterialTheme.typography.bodySmall,
-        fontWeight = FontWeight.Medium
-    )
-
-    Spacer(modifier = Modifier.height(8.dp))
-
-    Text(
-        "Приложения не перезапускаются — существующие задачи перемещаются на другой экран.",
-        style = MaterialTheme.typography.bodySmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant
-    )
 }
 
 @Composable

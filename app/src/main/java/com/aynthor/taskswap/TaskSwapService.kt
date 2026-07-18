@@ -25,6 +25,7 @@ import androidx.core.app.NotificationCompat
 import com.aynthor.taskswap.adb.AdbConnectionManager
 import com.aynthor.taskswap.adb.ShellExecutor
 import com.aynthor.taskswap.input.ButtonGestures
+import com.aynthor.taskswap.input.GestureSettings
 import com.aynthor.taskswap.input.ThorKeyMapper
 import com.aynthor.taskswap.task.DisplayPairing
 import com.aynthor.taskswap.task.DisplaySwapper
@@ -119,22 +120,22 @@ class TaskSwapService : AccessibilityService() {
     private val backLongPressRunnable = Runnable {
         if (!gestures.isBackHeld()) return@Runnable
         val decision = gestures.onBackHoldTimeout()
-        applyDecision(decision)
-        if (decision.actions.isNotEmpty()) vibrateShort()
+        val ranCustom = applyDecision(decision)
+        if (ranCustom) vibrateShort()
     }
 
     private val homeLongPressRunnable = Runnable {
         if (!gestures.isHomeHeld()) return@Runnable
         val decision = gestures.onHomeHoldTimeout()
-        applyDecision(decision)
-        if (decision.actions.isNotEmpty()) vibrateShort()
+        val ranCustom = applyDecision(decision)
+        if (ranCustom) vibrateShort()
     }
 
     private val aynLongPressRunnable = Runnable {
         if (!gestures.isAynHeld()) return@Runnable
         val decision = gestures.onAynHoldTimeout()
-        applyDecision(decision)
-        if (decision.actions.isNotEmpty()) vibrateShort()
+        val ranCustom = applyDecision(decision)
+        if (ranCustom) vibrateShort()
     }
 
     private val singleBackRunnable = Runnable {
@@ -268,6 +269,13 @@ class TaskSwapService : AccessibilityService() {
 
         val deviceName = event.device?.name
         val key = ThorKeyMapper.map(event.keyCode, event.source, deviceName) ?: return false
+        val gesturesEnabled = GestureSettings.isEnabled(this)
+
+        // When custom gestures are off, let system handle Back entirely.
+        if (!gesturesEnabled && key == ButtonGestures.Key.BACK) {
+            return false
+        }
+
         val act = when (event.action) {
             KeyEvent.ACTION_DOWN -> ButtonGestures.KeyAction.DOWN
             KeyEvent.ACTION_UP -> ButtonGestures.KeyAction.UP
@@ -280,7 +288,9 @@ class TaskSwapService : AccessibilityService() {
         if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount > 0) {
             lastKeyDebug =
                 "${KeyEvent.keyCodeToString(event.keyCode)}→$key REPEAT src=0x${Integer.toHexString(event.source)} dev=$deviceName"
-            maybeFireLongPressFromDownTime(key, event)
+            if (gesturesEnabled) {
+                maybeFireLongPressFromDownTime(key, event)
+            }
             return true
         }
 
@@ -302,8 +312,10 @@ class TaskSwapService : AccessibilityService() {
                     if (!gestures.isBackHeld()) {
                         snapshotPushActorAtBackDown()
                         handler.removeCallbacks(backLongPressRunnable)
-                        handler.postDelayed(backLongPressRunnable, holdThresholdMs)
-                    } else {
+                        if (gesturesEnabled) {
+                            handler.postDelayed(backLongPressRunnable, holdThresholdMs)
+                        }
+                    } else if (gesturesEnabled) {
                         maybeFireLongPressFromDownTime(key, event)
                     }
                 }
@@ -313,8 +325,10 @@ class TaskSwapService : AccessibilityService() {
                     handler.removeCallbacks(aynLongPressRunnable)
                     if (!gestures.isHomeHeld()) {
                         handler.removeCallbacks(homeLongPressRunnable)
-                        handler.postDelayed(homeLongPressRunnable, holdThresholdMs)
-                    } else {
+                        if (gesturesEnabled) {
+                            handler.postDelayed(homeLongPressRunnable, holdThresholdMs)
+                        }
+                    } else if (gesturesEnabled) {
                         maybeFireLongPressFromDownTime(key, event)
                     }
                 }
@@ -324,8 +338,10 @@ class TaskSwapService : AccessibilityService() {
                     handler.removeCallbacks(homeLongPressRunnable)
                     if (!gestures.isAynHeld()) {
                         handler.removeCallbacks(aynLongPressRunnable)
-                        handler.postDelayed(aynLongPressRunnable, holdThresholdMs)
-                    } else {
+                        if (gesturesEnabled) {
+                            handler.postDelayed(aynLongPressRunnable, holdThresholdMs)
+                        }
+                    } else if (gesturesEnabled) {
                         maybeFireLongPressFromDownTime(key, event)
                     }
                 }
@@ -377,21 +393,33 @@ class TaskSwapService : AccessibilityService() {
         return decision.consume
     }
 
-    private fun applyDecision(decision: ButtonGestures.Decision) {
+    /** @return true if at least one custom (non-system-short) action was started. */
+    private fun applyDecision(decision: ButtonGestures.Decision): Boolean {
         if (decision.cancelAynSystemInject) {
             handler.removeCallbacks(aynSingleTapRunnable)
         }
         if (decision.cancelHomeSystemInject) {
             handler.removeCallbacks(homeSingleTapRunnable)
         }
-        for (action in decision.actions) {
+        var ranCustom = false
+        for (raw in decision.actions) {
+            val action = when (raw) {
+                is ButtonGestures.Action.Custom -> GestureSettings.resolve(this, raw.slot)
+                else -> raw
+            } ?: continue
             when (action) {
                 ButtonGestures.Action.SystemBack -> performGlobalAction(GLOBAL_ACTION_BACK)
-                ButtonGestures.Action.OpenAllAppsList -> openAllAppsList()
+                is ButtonGestures.Action.Custom -> { /* already resolved */ }
+                ButtonGestures.Action.OpenAllAppsList -> {
+                    ranCustom = true
+                    openAllAppsList()
+                }
                 ButtonGestures.Action.MinimizeAllDisplays -> {
+                    ranCustom = true
                     if (!minimizeInProgress) scope.launch { minimizeAllApps() }
                 }
                 ButtonGestures.Action.SwapDisplaysOrSendSingle -> {
+                    ranCustom = true
                     handler.removeCallbacks(singleBackRunnable)
                     if (!swapInProgress) {
                         scope.launch {
@@ -405,6 +433,7 @@ class TaskSwapService : AccessibilityService() {
                     }
                 }
                 ButtonGestures.Action.PushActiveToOtherDisplay -> {
+                    ranCustom = true
                     handler.removeCallbacks(singleBackRunnable)
                     if (!swapInProgress) {
                         scope.launch {
@@ -426,6 +455,7 @@ class TaskSwapService : AccessibilityService() {
             // Short physical Home: deliver normal system Home without our long-press path.
             performGlobalAction(GLOBAL_ACTION_HOME)
         }
+        return ranCustom
     }
 
     private fun injectSystemAynShortPress() {
@@ -463,8 +493,8 @@ class TaskSwapService : AccessibilityService() {
                 gestures.onAynHoldTimeout()
             }
         }
-        applyDecision(decision)
-        if (decision.actions.isNotEmpty()) vibrateShort()
+        val ranCustom = applyDecision(decision)
+        if (ranCustom) vibrateShort()
     }
 
     /** System all-apps list ("список приложений"). */
