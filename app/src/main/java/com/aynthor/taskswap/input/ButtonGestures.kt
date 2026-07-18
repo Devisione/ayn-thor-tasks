@@ -1,10 +1,11 @@
 package com.aynthor.taskswap.input
 
 /**
- * Pure button gesture interpreter.
+ * Per-button gesture state (Back / Home / AYN).
  *
- * Configurable double/long slots emit [Action.Custom]; short presses stay system.
- * Home has no double-tap slot.
+ * AYN is always consumed so firmware never sees a held gpio HOME (that blanks the
+ * bottom screen). Short AYN schedules a gpio sendevent replay so the native AYN
+ * menu still opens; long AYN opens the all-apps list.
  */
 class ButtonGestures(
     private val holdThresholdMs: Long = 1000L,
@@ -15,12 +16,10 @@ class ButtonGestures(
 
     sealed class Action {
         data object SystemBack : Action()
-        /** System all-apps list ("список приложений"). */
         data object OpenAllAppsList : Action()
         data object MinimizeAllDisplays : Action()
         data object SwapDisplaysOrSendSingle : Action()
         data object PushActiveToOtherDisplay : Action()
-        /** User-configurable slot; resolved via [GestureSettings]. */
         data class Custom(val slot: GestureSettings.Slot) : Action()
     }
 
@@ -29,177 +28,131 @@ class ButtonGestures(
         val actions: List<Action> = emptyList(),
         val armBackSingleTimeout: Boolean = false,
         val scheduleHomeSystemInject: Boolean = false,
-        val scheduleAynSystemInject: Boolean = false,
-        val cancelHomeSystemInject: Boolean = false,
-        val cancelAynSystemInject: Boolean = false
+        /** Replay physical AYN via gpio sendevent (short press). */
+        val scheduleAynGpioInject: Boolean = false
     )
 
-    private var backDownAt: Long = -1L
-    private var backPendingSingle = false
-    private var backLongFired = false
+    private class HoldState {
+        var down = false
+        var longFired = false
+        var pendingSingle = false
+    }
 
-    private var homeDownAt: Long = -1L
-    private var homePendingSingle = false
-    private var homeLongFired = false
+    private val back = HoldState()
+    private val home = HoldState()
+    private val ayn = HoldState()
 
-    private var aynDownAt: Long = -1L
-    private var aynPendingSingle = false
-    private var aynLongFired = false
-    private var aynDoubleHandled = false
+    fun isBackHeld(): Boolean = back.down
+    fun isHomeHeld(): Boolean = home.down
+    fun isAynHeld(): Boolean = ayn.down
+    fun isBackLongFired(): Boolean = back.longFired
+    fun isHomeLongFired(): Boolean = home.longFired
+    fun isAynLongFired(): Boolean = ayn.longFired
 
-    fun isBackHeld(): Boolean = backDownAt >= 0L
-    fun isHomeHeld(): Boolean = homeDownAt >= 0L
-    fun isAynHeld(): Boolean = aynDownAt >= 0L
+    fun onKeyEvent(key: Key, action: KeyAction, eventTimeMs: Long = 0L): Decision {
+        return when (key) {
+            Key.BACK -> onBack(action)
+            Key.HOME -> onHome(action)
+            Key.AYN -> onAyn(action)
+        }
+    }
 
     fun onBackHoldTimeout(): Decision {
-        if (backDownAt < 0L || backLongFired) return Decision(consume = false)
-        backLongFired = true
-        backPendingSingle = false
+        if (!back.down || back.longFired) return Decision(consume = false)
+        back.longFired = true
+        back.pendingSingle = false
         return Decision(consume = true, actions = listOf(Action.Custom(GestureSettings.Slot.BACK_LONG)))
     }
 
     fun onHomeHoldTimeout(): Decision {
-        if (homeDownAt < 0L || homeLongFired) return Decision(consume = false)
-        homeLongFired = true
-        homePendingSingle = false
+        if (!home.down || home.longFired) return Decision(consume = false)
+        home.longFired = true
         return Decision(
             consume = true,
-            actions = listOf(Action.Custom(GestureSettings.Slot.HOME_LONG)),
-            cancelHomeSystemInject = true
+            actions = listOf(Action.Custom(GestureSettings.Slot.HOME_LONG))
         )
     }
 
     fun onAynHoldTimeout(): Decision {
-        if (aynDownAt < 0L || aynLongFired) return Decision(consume = false)
-        aynLongFired = true
-        aynPendingSingle = false
+        if (!ayn.down || ayn.longFired) return Decision(consume = false)
+        ayn.longFired = true
         return Decision(
             consume = true,
-            actions = listOf(Action.Custom(GestureSettings.Slot.AYN_LONG)),
-            cancelAynSystemInject = true
+            actions = listOf(Action.Custom(GestureSettings.Slot.AYN_LONG))
         )
     }
 
-    /** True after hold timeout fired for this press (until UP). */
-    fun isHomeLongFired(): Boolean = homeLongFired
-    fun isBackLongFired(): Boolean = backLongFired
-    fun isAynLongFired(): Boolean = aynLongFired
-
-    fun onKeyEvent(key: Key, action: KeyAction, eventTimeMs: Long): Decision {
-        return when (key) {
-            Key.BACK -> onBack(action, eventTimeMs)
-            Key.HOME -> onHome(action, eventTimeMs)
-            Key.AYN -> onAyn(action, eventTimeMs)
-        }
-    }
-
     fun onBackSingleTapTimeout(): Decision {
-        if (!backPendingSingle) return Decision(consume = false)
-        backPendingSingle = false
+        if (!back.pendingSingle) return Decision(consume = false)
+        back.pendingSingle = false
         return Decision(consume = true, actions = listOf(Action.SystemBack))
     }
 
-    fun onHomeSingleTapTimeout(): Decision {
-        if (!homePendingSingle) return Decision(consume = false)
-        homePendingSingle = false
-        return Decision(consume = false, scheduleHomeSystemInject = true)
-    }
-
-    fun onAynSingleTapTimeout(): Decision {
-        if (!aynPendingSingle) return Decision(consume = false)
-        aynPendingSingle = false
-        return Decision(consume = false, scheduleAynSystemInject = true)
-    }
-
-    private fun onBack(action: KeyAction, t: Long): Decision {
+    private fun onBack(action: KeyAction): Decision {
         return when (action) {
             KeyAction.DOWN -> {
-                if (backDownAt < 0L) {
-                    backDownAt = t
-                    backLongFired = false
+                if (!back.down) {
+                    back.down = true
+                    back.longFired = false
                 }
                 Decision(consume = true)
             }
             KeyAction.UP -> {
-                backDownAt = -1L
-                if (backLongFired) {
-                    backLongFired = false
-                    backPendingSingle = false
+                val wasLong = back.longFired
+                back.down = false
+                back.longFired = false
+                if (wasLong) {
+                    back.pendingSingle = false
                     return Decision(consume = true)
                 }
-                if (backPendingSingle) {
-                    backPendingSingle = false
+                if (back.pendingSingle) {
+                    back.pendingSingle = false
                     return Decision(
                         consume = true,
                         actions = listOf(Action.Custom(GestureSettings.Slot.BACK_DOUBLE))
                     )
                 }
-                backPendingSingle = true
+                back.pendingSingle = true
                 Decision(consume = true, armBackSingleTimeout = true)
             }
         }
     }
 
-    private fun onHome(action: KeyAction, t: Long): Decision {
+    private fun onHome(action: KeyAction): Decision {
         return when (action) {
             KeyAction.DOWN -> {
-                // Home has no double-tap gesture — clear pending so a second tap
-                // cannot be confused with AYN / open the app list.
-                homePendingSingle = false
-                if (homeDownAt < 0L) {
-                    homeDownAt = t
-                    homeLongFired = false
+                if (!home.down) {
+                    home.down = true
+                    home.longFired = false
                 }
-                Decision(consume = true, cancelHomeSystemInject = true)
+                Decision(consume = true)
             }
             KeyAction.UP -> {
-                homeDownAt = -1L
-                if (homeLongFired) {
-                    homeLongFired = false
-                    homePendingSingle = false
-                    return Decision(consume = true, cancelHomeSystemInject = true)
-                }
-                homePendingSingle = true
-                Decision(consume = true)
+                val wasLong = home.longFired
+                home.down = false
+                home.longFired = false
+                if (wasLong) return Decision(consume = true)
+                Decision(consume = true, scheduleHomeSystemInject = true)
             }
         }
     }
 
-    private fun onAyn(action: KeyAction, t: Long): Decision {
+    /** Always consume — firmware blanks bottom screen on held gpio AYN. */
+    private fun onAyn(action: KeyAction): Decision {
         return when (action) {
             KeyAction.DOWN -> {
-                // Always consume DOWN — otherwise Thor firmware dims/turns off the bottom screen.
-                if (aynPendingSingle) {
-                    aynPendingSingle = false
-                    aynDoubleHandled = true
-                    aynDownAt = t
-                    aynLongFired = false
-                    return Decision(consume = true, cancelAynSystemInject = true)
+                if (!ayn.down) {
+                    ayn.down = true
+                    ayn.longFired = false
                 }
-                if (aynDownAt < 0L) {
-                    aynDownAt = t
-                    aynLongFired = false
-                    aynDoubleHandled = false
-                }
-                Decision(consume = true, cancelAynSystemInject = true)
+                Decision(consume = true)
             }
             KeyAction.UP -> {
-                aynDownAt = -1L
-                if (aynLongFired) {
-                    aynLongFired = false
-                    aynPendingSingle = false
-                    return Decision(consume = true, cancelAynSystemInject = true)
-                }
-                if (aynDoubleHandled) {
-                    aynDoubleHandled = false
-                    return Decision(
-                        consume = true,
-                        actions = listOf(Action.Custom(GestureSettings.Slot.AYN_DOUBLE)),
-                        cancelAynSystemInject = true
-                    )
-                }
-                aynPendingSingle = true
-                Decision(consume = true)
+                val wasLong = ayn.longFired
+                ayn.down = false
+                ayn.longFired = false
+                if (wasLong) return Decision(consume = true)
+                Decision(consume = true, scheduleAynGpioInject = true)
             }
         }
     }

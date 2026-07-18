@@ -5,19 +5,15 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-/**
- * Contract: long AYN opens the system ALL-APPS list ("список приложений") by default.
- */
 class AynGestureContractTest {
 
     @Test
-    fun ayn_longPress_emitsAynLongSlot_defaultResolvesToAllApps() {
+    fun longAyn_opensAllApps_notMinimizeAll() {
         val g = ButtonGestures()
-        g.onKeyEvent(ButtonGestures.Key.AYN, ButtonGestures.KeyAction.DOWN, 0)
-        val timeout = g.onAynHoldTimeout()
+        g.onKeyEvent(ButtonGestures.Key.AYN, ButtonGestures.KeyAction.DOWN)
         assertEquals(
             listOf(ButtonGestures.Action.Custom(GestureSettings.Slot.AYN_LONG)),
-            timeout.actions
+            g.onAynHoldTimeout().actions
         )
         assertEquals(
             ButtonGestures.Action.OpenAllAppsList,
@@ -30,8 +26,11 @@ class AynGestureContractTest {
     }
 
     @Test
-    fun ayn_down_isConsumed_soFirmwareCannotKillBottomScreen() {
+    fun shortAyn_consumesAndSchedulesGpioReplay() {
         val g = ButtonGestures()
-        assertTrue(g.onKeyEvent(ButtonGestures.Key.AYN, ButtonGestures.KeyAction.DOWN, 0).consume)
+        assertTrue(g.onKeyEvent(ButtonGestures.Key.AYN, ButtonGestures.KeyAction.DOWN).consume)
+        val up = g.onKeyEvent(ButtonGestures.Key.AYN, ButtonGestures.KeyAction.UP)
+        assertTrue(up.consume)
+        assertTrue(up.scheduleAynGpioInject)
     }
 }

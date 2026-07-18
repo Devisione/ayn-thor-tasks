@@ -75,10 +75,43 @@ open class ShellExecutor {
         return AdbConnectionManager.shell(command)
     }
 
-    /** Inject a hardware key so a consumed AYN short-press can still open the system AYN menu. */
     open suspend fun inputKeyevent(keyCode: Int): Result<ShellResult> {
         val command = "input keyevent $keyCode"
         Log.d(TAG, command)
         return AdbConnectionManager.shell(command)
+    }
+
+    /**
+     * One real gpio tap (DOWN+SYN+UP+SYN). Used for short-AYN after we consumed the
+     * physical hold so firmware cannot blank the screen — still opens native AYN menu.
+     */
+    open suspend fun sendeventKeyPulse(eventNode: String, linuxKeyCode: Int): Result<ShellResult> {
+        val path = when {
+            eventNode.startsWith("/") -> eventNode
+            eventNode.startsWith("event") -> "/dev/input/$eventNode"
+            else -> "/dev/input/$eventNode"
+        }
+        val command =
+            "sendevent $path 1 $linuxKeyCode 1 && sendevent $path 0 0 0 && " +
+                "sendevent $path 1 $linuxKeyCode 0 && sendevent $path 0 0 0"
+        Log.d(TAG, command)
+        return AdbConnectionManager.shell(command)
+    }
+
+    open suspend fun findInputEventNode(deviceName: String): String? {
+        val output = AdbConnectionManager.shell("cat /proc/bus/input/devices").getOrNull()?.output
+            ?: return null
+        val needle = deviceName.lowercase()
+        var matching = false
+        for (line in output.lineSequence()) {
+            val t = line.trim()
+            if (t.startsWith("N: Name=")) {
+                matching = t.lowercase().contains(needle)
+            } else if (matching && t.startsWith("H: Handlers=")) {
+                val event = Regex("""event\d+""").find(t)?.value ?: continue
+                return event
+            }
+        }
+        return null
     }
 }

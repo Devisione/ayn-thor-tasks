@@ -9,9 +9,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.hardware.display.DisplayManager
+import android.provider.Settings
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
@@ -57,10 +59,47 @@ class TaskSwapService : AccessibilityService() {
         var lastSwapMessage: String = ""
             private set
 
-        /** Last filtered key for on-device debugging of Home/AYN mapping. */
+        /**
+         * Set true only for key-mapping diagnostics (no gesture actions).
+         * Confirmed Thor map (2026-07-18 device log):
+         * - Back: KEYCODE_BACK, Odin Controller, scan=158
+         * - Home: KEYCODE_HOME, Odin Controller, scan=102
+         * - AYN:  KEYCODE_HOME, gpio-keys, scan=194 (linux KEY_F24)
+         */
+        const val KEY_LOG_ONLY = false
+
+        /** Last single-line key summary for the UI. */
         @Volatile
         var lastKeyDebug: String = ""
             private set
+
+        /** Newest-first ring of raw key lines (for copy/screenshot). */
+        @Volatile
+        var keyLogHistory: List<String> = emptyList()
+            private set
+
+        private const val KEY_LOG_LIMIT = 40
+
+        private val keyLogLock = Any()
+
+        fun clearKeyLog() {
+            synchronized(keyLogLock) {
+                keyLogHistory = emptyList()
+                lastKeyDebug = ""
+            }
+        }
+
+        /** Append a line from getevent / external capture into the same UI log. */
+        fun appendExternalKeyLog(line: String) {
+            pushKeyLog(line)
+        }
+
+        private fun pushKeyLog(line: String) {
+            synchronized(keyLogLock) {
+                lastKeyDebug = line
+                keyLogHistory = (listOf(line) + keyLogHistory).take(KEY_LOG_LIMIT)
+            }
+        }
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -77,14 +116,6 @@ class TaskSwapService : AccessibilityService() {
 
     @Volatile
     private var minimizeInProgress = false
-
-    /**
-     * After injecting short-AYN via `input keyevent`, pass KEYCODE_HOME through to the system
-     * for a short window. Count-based ignore was dropping real Home/AYN presses when fewer
-     * synthetic events arrived than expected.
-     */
-    @Volatile
-    private var ignoreAynInjectUntilElapsedRealtime = 0L
 
     /**
      * Snapshot at Back DOWN for long-Back push.
@@ -117,38 +148,66 @@ class TaskSwapService : AccessibilityService() {
     }
     private val launcherPackages = mutableSetOf<String>()
 
-    private val backLongPressRunnable = Runnable {
-        if (!gestures.isBackHeld()) return@Runnable
-        val decision = gestures.onBackHoldTimeout()
-        val ranCustom = applyDecision(decision)
-        if (ranCustom) vibrateShort()
+    // --- One long-press timer per physical button (DOWN start / UP cancel / fire → done) ---
+
+    private val backLongRunnable = Runnable { fireLong(ButtonGestures.Key.BACK) }
+    private val homeLongRunnable = Runnable { fireLong(ButtonGestures.Key.HOME) }
+    private val aynLongRunnable = Runnable { fireLong(ButtonGestures.Key.AYN) }
+
+    private fun fireLong(key: ButtonGestures.Key) {
+        val decision = when (key) {
+            ButtonGestures.Key.BACK -> {
+                if (!gestures.isBackHeld()) return
+                gestures.onBackHoldTimeout()
+            }
+            ButtonGestures.Key.HOME -> {
+                if (!gestures.isHomeHeld()) return
+                gestures.onHomeHoldTimeout()
+            }
+            ButtonGestures.Key.AYN -> {
+                if (!gestures.isAynHeld()) return
+                // Physical AYN is consumed — firmware never sees the hold, so no blank.
+                gestures.onAynHoldTimeout()
+            }
+        }
+        val ran = applyDecision(decision)
+        if (ran) vibrateShort()
+        Log.i(TAG, "$key long fired")
     }
 
-    private val homeLongPressRunnable = Runnable {
-        if (!gestures.isHomeHeld()) return@Runnable
-        val decision = gestures.onHomeHoldTimeout()
-        val ranCustom = applyDecision(decision)
-        if (ranCustom) vibrateShort()
-    }
-
-    private val aynLongPressRunnable = Runnable {
-        if (!gestures.isAynHeld()) return@Runnable
-        val decision = gestures.onAynHoldTimeout()
-        val ranCustom = applyDecision(decision)
-        if (ranCustom) vibrateShort()
-    }
-
-    private val singleBackRunnable = Runnable {
+    private val backSingleRunnable = Runnable {
         applyDecision(gestures.onBackSingleTapTimeout())
     }
 
-    private val homeSingleTapRunnable = Runnable {
-        applyDecision(gestures.onHomeSingleTapTimeout())
+    /**
+     * After short-AYN gpio replay, let the next DOWN+UP reach the system (native AYN menu)
+     * without re-entering gesture state. Must NOT swallow — that was why menu never opened.
+     */
+    @Volatile
+    private var remainingAynReplayPassThrough = 0
+
+    @Volatile
+    private var aynReplayUntilElapsed = 0L
+
+    @Volatile
+    private var cachedGpioEventNode: String? = null
+
+    private fun longRunnableFor(key: ButtonGestures.Key): Runnable = when (key) {
+        ButtonGestures.Key.BACK -> backLongRunnable
+        ButtonGestures.Key.HOME -> homeLongRunnable
+        ButtonGestures.Key.AYN -> aynLongRunnable
     }
 
-    private val aynSingleTapRunnable = Runnable {
-        applyDecision(gestures.onAynSingleTapTimeout())
+    private fun armLongTimer(key: ButtonGestures.Key) {
+        val r = longRunnableFor(key)
+        handler.removeCallbacks(r)
+        handler.postDelayed(r, holdThresholdMs)
     }
+
+    private fun cancelLongTimer(key: ButtonGestures.Key) {
+        handler.removeCallbacks(longRunnableFor(key))
+    }
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         AdbConnectionManager.init(applicationContext)
@@ -172,9 +231,34 @@ class TaskSwapService : AccessibilityService() {
 
         scope.launch {
             AdbConnectionManager.reconnect()
+            disableOdinAccidentalHomeGuard()
         }
 
         Log.d(TAG, "Connected, displays: $availableDisplayIds")
+    }
+
+    /**
+     * Odin Game Assistant "Prevent pressing Home accidentally" swallows the first Home
+     * and shows "press home again to return to launcher". Disable so we can own Home.
+     */
+    private suspend fun disableOdinAccidentalHomeGuard() {
+        val key = "prevent_press_home_accidentally"
+        try {
+            val cur = Settings.System.getInt(contentResolver, key, 1)
+            if (cur != 0) {
+                val ok = Settings.System.putInt(contentResolver, key, 0)
+                Log.i(TAG, "Settings.System $key: $cur → 0 (put=$ok)")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Cannot write $key via Settings: ${e.message}")
+        }
+        // ADB path — works without WRITE_SETTINGS when wireless ADB is up.
+        val shell = AdbConnectionManager.shell("settings put system $key 0")
+        if (shell.isSuccess) {
+            Log.i(TAG, "ADB disabled $key")
+        } else {
+            Log.w(TAG, "ADB disable $key: ${shell.exceptionOrNull()?.message}")
+        }
     }
 
     override fun onInterrupt() {}
@@ -259,21 +343,38 @@ class TaskSwapService : AccessibilityService() {
     }
 
     override fun onKeyEvent(event: KeyEvent): Boolean {
-        // Injected short-AYN must reach the system; everything else for HOME must be filtered
-        // or Thor firmware turns off / dims the bottom screen on long-press.
-        if (event.keyCode == KeyEvent.KEYCODE_HOME &&
-            SystemClock.elapsedRealtime() < ignoreAynInjectUntilElapsedRealtime
-        ) {
+        val line = formatKeyLogLine(event)
+        pushKeyLog(line)
+        Log.i(TAG, "KEY $line")
+
+        if (KEY_LOG_ONLY) {
+            // Consume Thor keys so system Home does not leave the app before you see the log.
+            // (Previously return false → first Home minimized/left the app; second press looked "broken".)
+            if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
+                vibrateShort()
+            }
+            return true
+        }
+
+        // --- normal gesture path ---
+        // gpio replay for short AYN: pass through to system, skip gesture re-entry.
+        if (shouldPassThroughAynReplay(event)) {
+            remainingAynReplayPassThrough = (remainingAynReplayPassThrough - 1).coerceAtLeast(0)
+            if (remainingAynReplayPassThrough == 0) aynReplayUntilElapsed = 0L
+            Log.d(TAG, "AYN replay pass-through (${remainingAynReplayPassThrough} left)")
             return false
         }
 
         val deviceName = event.device?.name
-        val key = ThorKeyMapper.map(event.keyCode, event.source, deviceName) ?: return false
-        val gesturesEnabled = GestureSettings.isEnabled(this)
+        val key = ThorKeyMapper.map(event.keyCode, event.source, deviceName)
+        if (key == null) return false
 
-        // When custom gestures are off, let system handle Back entirely.
-        if (!gesturesEnabled && key == ButtonGestures.Key.BACK) {
-            return false
+        val gesturesEnabled = GestureSettings.isEnabled(this)
+        if (!gesturesEnabled) return false
+
+        if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount > 0) {
+            // AYN DOWN is consumed — eat repeats so firmware never sees a hold.
+            return true
         }
 
         val act = when (event.action) {
@@ -282,83 +383,25 @@ class TaskSwapService : AccessibilityService() {
             else -> return false
         }
 
-        // Key repeats still must be consumed for AYN/Home or firmware steals the hold.
-        // Also use downTime as a backup long-press trigger if the Handler timer was starved
-        // by duplicate zero-repeat DOWNs from the controller firmware.
-        if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount > 0) {
-            lastKeyDebug =
-                "${KeyEvent.keyCodeToString(event.keyCode)}→$key REPEAT src=0x${Integer.toHexString(event.source)} dev=$deviceName"
-            if (gesturesEnabled) {
-                maybeFireLongPressFromDownTime(key, event)
+        when (act) {
+            ButtonGestures.KeyAction.DOWN -> {
+                val alreadyHeld = when (key) {
+                    ButtonGestures.Key.BACK -> gestures.isBackHeld()
+                    ButtonGestures.Key.HOME -> gestures.isHomeHeld()
+                    ButtonGestures.Key.AYN -> gestures.isAynHeld()
+                }
+                if (key == ButtonGestures.Key.BACK) {
+                    handler.removeCallbacks(backSingleRunnable)
+                    if (!alreadyHeld) snapshotPushActorAtBackDown()
+                }
+                if (!alreadyHeld) armLongTimer(key)
             }
-            return true
-        }
-
-        lastKeyDebug =
-            "${KeyEvent.keyCodeToString(event.keyCode)}→$key src=0x${Integer.toHexString(event.source)} dev=$deviceName"
-        Log.d(
-            TAG,
-            "key=${KeyEvent.keyCodeToString(event.keyCode)} mapped=$key " +
-                "source=0x${Integer.toHexString(event.source)} device=$deviceName " +
-                "action=${event.action} repeat=${event.repeatCount}"
-        )
-
-        if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
-            when (key) {
-                ButtonGestures.Key.BACK -> {
-                    handler.removeCallbacks(singleBackRunnable)
-                    // Arm long-press only once per physical hold. Duplicate DOWN(repeat=0)
-                    // from gamepad firmware must not reset the 1s timer (Home was never firing).
-                    if (!gestures.isBackHeld()) {
-                        snapshotPushActorAtBackDown()
-                        handler.removeCallbacks(backLongPressRunnable)
-                        if (gesturesEnabled) {
-                            handler.postDelayed(backLongPressRunnable, holdThresholdMs)
-                        }
-                    } else if (gesturesEnabled) {
-                        maybeFireLongPressFromDownTime(key, event)
-                    }
+            ButtonGestures.KeyAction.UP -> {
+                cancelLongTimer(key)
+                if (key == ButtonGestures.Key.BACK && !gestures.isBackLongFired()) {
+                    backDownActiveDisplayId = null
+                    backDownActivePackage = null
                 }
-                ButtonGestures.Key.HOME -> {
-                    handler.removeCallbacks(homeSingleTapRunnable)
-                    handler.removeCallbacks(aynSingleTapRunnable)
-                    handler.removeCallbacks(aynLongPressRunnable)
-                    if (!gestures.isHomeHeld()) {
-                        handler.removeCallbacks(homeLongPressRunnable)
-                        if (gesturesEnabled) {
-                            handler.postDelayed(homeLongPressRunnable, holdThresholdMs)
-                        }
-                    } else if (gesturesEnabled) {
-                        maybeFireLongPressFromDownTime(key, event)
-                    }
-                }
-                ButtonGestures.Key.AYN -> {
-                    handler.removeCallbacks(aynSingleTapRunnable)
-                    handler.removeCallbacks(homeSingleTapRunnable)
-                    handler.removeCallbacks(homeLongPressRunnable)
-                    if (!gestures.isAynHeld()) {
-                        handler.removeCallbacks(aynLongPressRunnable)
-                        if (gesturesEnabled) {
-                            handler.postDelayed(aynLongPressRunnable, holdThresholdMs)
-                        }
-                    } else if (gesturesEnabled) {
-                        maybeFireLongPressFromDownTime(key, event)
-                    }
-                }
-            }
-        }
-
-        if (event.action == KeyEvent.ACTION_UP) {
-            when (key) {
-                ButtonGestures.Key.BACK -> {
-                    handler.removeCallbacks(backLongPressRunnable)
-                    if (!gestures.isBackLongFired()) {
-                        backDownActiveDisplayId = null
-                        backDownActivePackage = null
-                    }
-                }
-                ButtonGestures.Key.HOME -> handler.removeCallbacks(homeLongPressRunnable)
-                ButtonGestures.Key.AYN -> handler.removeCallbacks(aynLongPressRunnable)
             }
         }
 
@@ -366,41 +409,66 @@ class TaskSwapService : AccessibilityService() {
         applyDecision(decision)
 
         if (decision.armBackSingleTimeout) {
-            handler.removeCallbacks(singleBackRunnable)
-            handler.postDelayed(singleBackRunnable, doubleTapWindowMs)
-        }
-        if (key == ButtonGestures.Key.HOME &&
-            event.action == KeyEvent.ACTION_UP &&
-            decision.consume &&
-            decision.actions.isEmpty() &&
-            !decision.cancelHomeSystemInject &&
-            !decision.scheduleHomeSystemInject
-        ) {
-            handler.removeCallbacks(homeSingleTapRunnable)
-            handler.postDelayed(homeSingleTapRunnable, doubleTapWindowMs)
-        }
-        if (key == ButtonGestures.Key.AYN &&
-            event.action == KeyEvent.ACTION_UP &&
-            decision.consume &&
-            decision.actions.isEmpty() &&
-            !decision.cancelAynSystemInject &&
-            !decision.scheduleAynSystemInject
-        ) {
-            handler.removeCallbacks(aynSingleTapRunnable)
-            handler.postDelayed(aynSingleTapRunnable, doubleTapWindowMs)
+            handler.removeCallbacks(backSingleRunnable)
+            handler.postDelayed(backSingleRunnable, doubleTapWindowMs)
         }
 
         return decision.consume
     }
 
+    private fun formatKeyLogLine(event: KeyEvent): String {
+        val action = when (event.action) {
+            KeyEvent.ACTION_DOWN -> "DOWN"
+            KeyEvent.ACTION_UP -> "UP"
+            else -> "ACT${event.action}"
+        }
+        val device = event.device
+        val deviceName = device?.name ?: "null"
+        val mapped = ThorKeyMapper.map(event.keyCode, event.source, device?.name)?.name ?: "?"
+        val vendor = device?.vendorId ?: -1
+        val product = device?.productId ?: -1
+        val descriptor = try {
+            device?.descriptor?.take(24) ?: "-"
+        } catch (_: Exception) {
+            "-"
+        }
+        return buildString {
+            append(action)
+            append(' ')
+            append(KeyEvent.keyCodeToString(event.keyCode))
+            append('(')
+            append(event.keyCode)
+            append(") map=")
+            append(mapped)
+            append(" src=0x")
+            append(Integer.toHexString(event.source))
+            append(" devId=")
+            append(event.deviceId)
+            append(" name=")
+            append(deviceName)
+            append(" scan=")
+            append(event.scanCode)
+            append(" rep=")
+            append(event.repeatCount)
+            append(" flags=0x")
+            append(Integer.toHexString(event.flags))
+            append(" meta=0x")
+            append(Integer.toHexString(event.metaState))
+            append(" vid=")
+            append(vendor)
+            append(" pid=")
+            append(product)
+            append(" desc=")
+            append(descriptor)
+            append(" down=")
+            append(event.downTime)
+            append(" t=")
+            append(event.eventTime)
+        }
+    }
+
     /** @return true if at least one custom (non-system-short) action was started. */
     private fun applyDecision(decision: ButtonGestures.Decision): Boolean {
-        if (decision.cancelAynSystemInject) {
-            handler.removeCallbacks(aynSingleTapRunnable)
-        }
-        if (decision.cancelHomeSystemInject) {
-            handler.removeCallbacks(homeSingleTapRunnable)
-        }
         var ranCustom = false
         for (raw in decision.actions) {
             val action = when (raw) {
@@ -412,6 +480,8 @@ class TaskSwapService : AccessibilityService() {
                 is ButtonGestures.Action.Custom -> { /* already resolved */ }
                 ButtonGestures.Action.OpenAllAppsList -> {
                     ranCustom = true
+                    // Wake before launching — long AYN must not leave the bottom screen off.
+                    wakeScreen()
                     openAllAppsList()
                 }
                 ButtonGestures.Action.MinimizeAllDisplays -> {
@@ -420,7 +490,7 @@ class TaskSwapService : AccessibilityService() {
                 }
                 ButtonGestures.Action.SwapDisplaysOrSendSingle -> {
                     ranCustom = true
-                    handler.removeCallbacks(singleBackRunnable)
+                    handler.removeCallbacks(backSingleRunnable)
                     if (!swapInProgress) {
                         scope.launch {
                             swapInProgress = true
@@ -434,7 +504,7 @@ class TaskSwapService : AccessibilityService() {
                 }
                 ButtonGestures.Action.PushActiveToOtherDisplay -> {
                     ranCustom = true
-                    handler.removeCallbacks(singleBackRunnable)
+                    handler.removeCallbacks(backSingleRunnable)
                     if (!swapInProgress) {
                         scope.launch {
                             swapInProgress = true
@@ -448,53 +518,74 @@ class TaskSwapService : AccessibilityService() {
                 }
             }
         }
-        if (decision.scheduleAynSystemInject) {
-            injectSystemAynShortPress()
-        }
         if (decision.scheduleHomeSystemInject) {
-            // Short physical Home: deliver normal system Home without our long-press path.
             performGlobalAction(GLOBAL_ACTION_HOME)
+        }
+        if (decision.scheduleAynGpioInject) {
+            scope.launch { injectGpioAynShort() }
         }
         return ranCustom
     }
 
-    private fun injectSystemAynShortPress() {
-        scope.launch {
-            ignoreAynInjectUntilElapsedRealtime = SystemClock.elapsedRealtime() + 400L
-            val result = shellExecutor.inputKeyevent(KeyEvent.KEYCODE_HOME)
-            if (result.isFailure || result.getOrNull()?.success != true) {
-                Log.w(TAG, "Failed to inject AYN short press: ${result.exceptionOrNull()?.message ?: result.getOrNull()?.output}")
-                ignoreAynInjectUntilElapsedRealtime = 0L
-            }
+    /**
+     * Replay one gpio AYN tap so the vendor menu opens after we consumed the physical press.
+     * Echoes must pass through (not be swallowed) — otherwise the menu never sees the key.
+     */
+    private suspend fun injectGpioAynShort() {
+        val node = cachedGpioEventNode
+            ?: shellExecutor.findInputEventNode("gpio-keys")?.also { cachedGpioEventNode = it }
+        if (node == null) {
+            Log.w(TAG, "AYN short: gpio node not found (is wireless ADB connected?)")
+            return
+        }
+        remainingAynReplayPassThrough = 2
+        aynReplayUntilElapsed = SystemClock.elapsedRealtime() + 1_200L
+        val result = shellExecutor.sendeventKeyPulse(node, ThorKeyMapper.SCAN_AYN_F24)
+        if (result.isSuccess && result.getOrNull()?.success == true) {
+            Log.i(TAG, "AYN short: sendevent gpio pulse on $node")
+        } else {
+            remainingAynReplayPassThrough = 0
+            aynReplayUntilElapsed = 0L
+            Log.w(
+                TAG,
+                "AYN short: sendevent failed: ${result.exceptionOrNull()?.message ?: result.getOrNull()?.output}"
+            )
         }
     }
 
-    /**
-     * Backup long-press path: controller may spam DOWN with repeatCount=0 while held,
-     * which used to keep re-arming postDelayed(1000) and never fire. When already held,
-     * fire once [holdThresholdMs] has elapsed since KeyEvent.downTime.
-     */
-    private fun maybeFireLongPressFromDownTime(key: ButtonGestures.Key, event: KeyEvent) {
-        if (event.eventTime - event.downTime < holdThresholdMs) return
-        val decision = when (key) {
-            ButtonGestures.Key.BACK -> {
-                if (!gestures.isBackHeld() || gestures.isBackLongFired()) return
-                handler.removeCallbacks(backLongPressRunnable)
-                gestures.onBackHoldTimeout()
-            }
-            ButtonGestures.Key.HOME -> {
-                if (!gestures.isHomeHeld() || gestures.isHomeLongFired()) return
-                handler.removeCallbacks(homeLongPressRunnable)
-                gestures.onHomeHoldTimeout()
-            }
-            ButtonGestures.Key.AYN -> {
-                if (!gestures.isAynHeld() || gestures.isAynLongFired()) return
-                handler.removeCallbacks(aynLongPressRunnable)
-                gestures.onAynHoldTimeout()
-            }
+    private fun shouldPassThroughAynReplay(event: KeyEvent): Boolean {
+        if (remainingAynReplayPassThrough <= 0) return false
+        if (SystemClock.elapsedRealtime() >= aynReplayUntilElapsed) {
+            remainingAynReplayPassThrough = 0
+            return false
         }
-        val ranCustom = applyDecision(decision)
-        if (ranCustom) vibrateShort()
+        if (event.keyCode != KeyEvent.KEYCODE_HOME && event.keyCode != ThorKeyMapper.KEYCODE_F24) {
+            return false
+        }
+        val name = event.device?.name?.lowercase().orEmpty()
+        if (name.contains("odin") || name.contains("controller") || name.contains("gamepad")) {
+            return false
+        }
+        return true
+    }
+
+    /** Keep display awake when opening All Apps (safety net). */
+    private fun wakeScreen() {
+        try {
+            val pm = getSystemService(PowerManager::class.java) ?: return
+            @Suppress("DEPRECATION")
+            val wakeLock = pm.newWakeLock(
+                PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                "thor:ayn_long"
+            )
+            wakeLock.acquire(3_000)
+            wakeLock.release()
+        } catch (e: Exception) {
+            Log.w(TAG, "wakeScreen wakeLock: ${e.message}")
+        }
+        scope.launch {
+            shellExecutor.inputKeyevent(KeyEvent.KEYCODE_WAKEUP)
+        }
     }
 
     /** System all-apps list ("список приложений"). */
@@ -530,10 +621,12 @@ class TaskSwapService : AccessibilityService() {
             scanAllDisplayApps()
             refreshDisplayMapFromDumpsys()
 
-            val pair = DisplayPairing.pickSwapDisplays(availableDisplayIds, displayApps.keys)
-            val targets = (pair.ifEmpty { availableDisplayIds }).mapNotNull { displayId ->
-                displayApps[displayId]?.let { displayId to it }
-            }
+            // Hide every known app — not only the swap-pair peer (scan can miss one side).
+            val targets = displayApps.entries.map { it.key to it.value }
+            val homeDisplays = DisplayPairing.displaysForMinimize(
+                availableDisplayIds,
+                displayApps.keys
+            ).ifEmpty { availableDisplayIds.take(2) }
 
             var hiddenCount = 0
             for ((displayId, pkg) in targets) {
@@ -550,13 +643,27 @@ class TaskSwapService : AccessibilityService() {
                 }
             }
 
-            // Always send each main display to Home so empty screens also reset.
-            for (displayId in pair.ifEmpty { availableDisplayIds.take(2) }) {
-                shellExecutor.launchHomeOnDisplay(displayId)
+            // Always Home every minimize target so both Thor screens reset even when hide fails.
+            var homeOk = 0
+            for (displayId in homeDisplays) {
+                val home = shellExecutor.launchHomeOnDisplay(displayId)
+                if (home.isSuccess && home.getOrNull()?.success == true) {
+                    homeOk++
+                } else {
+                    Log.w(
+                        TAG,
+                        "Home on display $displayId failed: " +
+                            "${home.exceptionOrNull()?.message ?: home.getOrNull()?.output}"
+                    )
+                }
+            }
+            // Default display fallback when ADB home is flaky.
+            if (homeOk == 0 && homeDisplays.isNotEmpty()) {
+                performGlobalAction(GLOBAL_ACTION_HOME)
             }
 
-            lastSwapMessage = if (hiddenCount > 0 || pair.isNotEmpty()) {
-                "Свернули приложения / Home на экранах $pair"
+            lastSwapMessage = if (hiddenCount > 0 || homeOk > 0) {
+                "Свернули приложения / Home на экранах $homeDisplays"
             } else {
                 "Не удалось свернуть приложения"
             }

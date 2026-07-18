@@ -1,10 +1,16 @@
 package com.aynthor.taskswap.input
 
 /**
- * Maps raw Android keyCode (+ optional device name) to logical Thor buttons.
+ * Thor button map — confirmed on device 2026-07-18:
  *
- * Both physical Home and AYN can arrive as KEYCODE_HOME on Thor.
- * Distinguish by device name / source — never treat every KEYCODE_HOME the same.
+ * | Button | KeyEvent | Device | scan |
+ * |--------|----------|--------|------|
+ * | Back | KEYCODE_BACK (4) | Odin Controller | 158 |
+ * | Home | KEYCODE_HOME (3) | Odin Controller | 102 |
+ * | AYN  | KEYCODE_HOME (3) | gpio-keys | 194 (linux KEY_F24) |
+ *
+ * Never map KEYCODE_HOME → Home without checking device name.
+ * Never map all F24 → Home — gpio F24/HOME family is AYN.
  */
 object ThorKeyMapper {
 
@@ -12,6 +18,11 @@ object ThorKeyMapper {
     const val KEYCODE_HOME = 3
     const val KEYCODE_F24 = 337
     const val KEYCODE_BUTTON_MODE = 110
+
+    /** Linux scan codes from Thor getevent / KeyEvent.scanCode. */
+    const val SCAN_HOME = 102
+    const val SCAN_AYN_F24 = 194
+    const val SCAN_BACK = 158
 
     const val SOURCE_GAMEPAD = 0x00000401
     const val SOURCE_JOYSTICK = 0x01000010
@@ -23,38 +34,21 @@ object ThorKeyMapper {
     fun map(keyCode: Int, source: Int = 0, deviceName: String? = null): ButtonGestures.Key? {
         return when {
             keyCode == KEYCODE_BACK -> ButtonGestures.Key.BACK
-            keyCode == KEYCODE_F24 -> ButtonGestures.Key.HOME
             keyCode == KEYCODE_BUTTON_MODE -> ButtonGestures.Key.HOME
-            keyCode == KEYCODE_HOME -> mapKeycodeHome(source, deviceName)
+            keyCode == KEYCODE_F24 -> mapByDevice(deviceName, controllerDefault = ButtonGestures.Key.HOME)
+            keyCode == KEYCODE_HOME -> mapByDevice(deviceName, controllerDefault = ButtonGestures.Key.HOME)
             else -> null
         }
     }
 
-    /**
-     * Chin AYN button is usually gpio / non-controller.
-     * Gamepad Home is usually Odin/controller device, often with gamepad source.
-     */
-    private fun mapKeycodeHome(source: Int, deviceName: String?): ButtonGestures.Key {
+    private fun mapByDevice(
+        deviceName: String?,
+        controllerDefault: ButtonGestures.Key
+    ): ButtonGestures.Key {
         val n = deviceName?.lowercase().orEmpty()
-        // Controller name wins over generic "ayn" substring in product strings.
-        if (isControllerDeviceName(n)) return ButtonGestures.Key.HOME
-        if (isAynDeviceName(n)) return ButtonGestures.Key.AYN
-        return if ((source and GAMEPAD_SOURCES) != 0) {
-            ButtonGestures.Key.HOME
-        } else {
-            ButtonGestures.Key.AYN
-        }
-    }
-
-    private fun isAynDeviceName(n: String): Boolean {
-        if (n.isEmpty()) return false
-        return n.contains("gpio") ||
-            n.contains("pmic") ||
-            n.contains("hall") ||
-            n.contains("qpnp") ||
-            n.contains("pm8") ||
-            n.contains("sec_key") ||
-            n.contains("chin")
+        if (isControllerDeviceName(n)) return controllerDefault
+        // gpio-keys (and any non-controller) → AYN
+        return ButtonGestures.Key.AYN
     }
 
     private fun isControllerDeviceName(n: String): Boolean {

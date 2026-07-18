@@ -15,6 +15,23 @@ class DisplayPairingTest {
     }
 
     @Test
+    fun displaysForMinimize_includesPairAndEveryAppDisplay() {
+        // Pair alone is [0,1] (first peer), but app on 2 must also receive Home.
+        assertEquals(
+            listOf(0, 1, 2),
+            DisplayPairing.displaysForMinimize(listOf(0, 1, 2, 4), setOf(1, 2))
+        )
+        assertEquals(
+            listOf(0, 2),
+            DisplayPairing.displaysForMinimize(listOf(0, 1, 2, 4), setOf(2))
+        )
+        assertEquals(
+            listOf(0, 1),
+            DisplayPairing.displaysForMinimize(listOf(0, 1, 2), emptySet())
+        )
+    }
+
+    @Test
     fun merge_includesAccessibilityWhenDumpsysEmpty_forSingleApp() {
         val merged = DisplayPairing.mergeDisplayApps(
             fromDumpsys = emptyMap(),

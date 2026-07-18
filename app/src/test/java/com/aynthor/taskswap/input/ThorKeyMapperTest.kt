@@ -16,12 +16,26 @@ class ThorKeyMapperTest {
     }
 
     @Test
-    fun f24_alwaysMapsToPhysicalHome() {
-        assertEquals(ButtonGestures.Key.HOME, ThorKeyMapper.map(ThorKeyMapper.KEYCODE_F24, 0))
+    fun f24_gpioKeys_isAyn_notHome() {
+        // getevent: /dev/input/event0 gpio-keys KEY_F24 = chin AYN
+        assertEquals(
+            ButtonGestures.Key.AYN,
+            ThorKeyMapper.map(ThorKeyMapper.KEYCODE_F24, 0x101, "gpio-keys")
+        )
+    }
+
+    @Test
+    fun f24_odinController_isHome() {
         assertEquals(
             ButtonGestures.Key.HOME,
-            ThorKeyMapper.map(ThorKeyMapper.KEYCODE_F24, ThorKeyMapper.SOURCE_GAMEPAD)
+            ThorKeyMapper.map(ThorKeyMapper.KEYCODE_F24, 0x501, "Odin Controller")
         )
+    }
+
+    @Test
+    fun f24_withoutDeviceName_isAyn_notHome() {
+        // Unknown device: do NOT treat as Home (would steal AYN)
+        assertEquals(ButtonGestures.Key.AYN, ThorKeyMapper.map(ThorKeyMapper.KEYCODE_F24, 0))
     }
 
     @Test
@@ -30,43 +44,26 @@ class ThorKeyMapperTest {
     }
 
     @Test
-    fun keycodeHome_gpioDevice_isAyn() {
+    fun keycodeHome_gpioKeys_isAyn_fromDeviceLog() {
         assertEquals(
             ButtonGestures.Key.AYN,
-            ThorKeyMapper.map(ThorKeyMapper.KEYCODE_HOME, 0, "gpio-keys")
-        )
-        assertEquals(
-            ButtonGestures.Key.AYN,
-            ThorKeyMapper.map(ThorKeyMapper.KEYCODE_HOME, ThorKeyMapper.SOURCE_GAMEPAD, "gpio-keys")
+            ThorKeyMapper.map(ThorKeyMapper.KEYCODE_HOME, 0x101, "gpio-keys")
         )
     }
 
     @Test
-    fun keycodeHome_controllerDevice_isHome() {
+    fun keycodeHome_odinController_isHome_fromDeviceLog() {
         assertEquals(
             ButtonGestures.Key.HOME,
-            ThorKeyMapper.map(ThorKeyMapper.KEYCODE_HOME, ThorKeyMapper.SOURCE_GAMEPAD, "Odin Controller")
-        )
-        assertEquals(
-            ButtonGestures.Key.HOME,
-            ThorKeyMapper.map(ThorKeyMapper.KEYCODE_HOME, 0, "AYN Gamepad")
+            ThorKeyMapper.map(ThorKeyMapper.KEYCODE_HOME, 0x501, "Odin Controller")
         )
     }
 
     @Test
-    fun keycodeHome_gamepadSourceWithoutName_isHome() {
+    fun keycodeHome_gamepadSourceWithoutName_isAyn_notHome() {
         assertEquals(
-            ButtonGestures.Key.HOME,
+            ButtonGestures.Key.AYN,
             ThorKeyMapper.map(ThorKeyMapper.KEYCODE_HOME, ThorKeyMapper.SOURCE_GAMEPAD)
-        )
-    }
-
-    @Test
-    fun keycodeHome_plainSource_isAyn() {
-        assertEquals(ButtonGestures.Key.AYN, ThorKeyMapper.map(ThorKeyMapper.KEYCODE_HOME, 0))
-        assertEquals(
-            ButtonGestures.Key.AYN,
-            ThorKeyMapper.map(ThorKeyMapper.KEYCODE_HOME, 0x00001000)
         )
     }
 

@@ -28,6 +28,20 @@ object DisplayPairing {
     }
 
     /**
+     * Displays that must receive Home on minimize-all: the swap pair plus every
+     * display that currently hosts an app (so a missed pair peer cannot leave an app up).
+     */
+    fun displaysForMinimize(
+        displayIds: List<Int>,
+        appDisplays: Set<Int>
+    ): List<Int> {
+        val idSet = displayIds.toSet()
+        val pair = pickSwapDisplays(displayIds, appDisplays)
+        val withApps = appDisplays.filter { it in idSet }
+        return (pair + withApps).distinct().sorted()
+    }
+
+    /**
      * Merge dumpsys + accessibility maps for the given swap displays.
      * Accessibility wins on conflicts — dumpsys underlays on an "empty" screen must not
      * override what the user actually sees (especially the bottom display on Thor).

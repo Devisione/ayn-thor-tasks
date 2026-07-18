@@ -184,6 +184,12 @@ fun MainScreen() {
             color = MaterialTheme.colorScheme.onBackground
         )
         Text("v1.1.0", style = MaterialTheme.typography.labelSmall)
+        if (lastKeyDebug.isNotBlank()) {
+            Text(
+                "Последняя кнопка: $lastKeyDebug",
+                style = MaterialTheme.typography.labelSmall
+            )
+        }
 
         if (isPairing || isConnecting) {
             StatusBanner(
@@ -353,9 +359,6 @@ fun MainScreen() {
 
             if (lastSwapMessage.isNotBlank()) {
                 Text("Последний обмен: $lastSwapMessage", style = MaterialTheme.typography.bodySmall)
-            }
-            if (lastKeyDebug.isNotBlank()) {
-                Text("Последняя кнопка: $lastKeyDebug", style = MaterialTheme.typography.labelSmall)
             }
 
         }
