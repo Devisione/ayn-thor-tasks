@@ -183,7 +183,7 @@ fun MainScreen() {
             style = MaterialTheme.typography.headlineSmall,
             color = MaterialTheme.colorScheme.onBackground
         )
-        Text("v1.1.0", style = MaterialTheme.typography.labelSmall)
+        Text("v1.2.0", style = MaterialTheme.typography.labelSmall)
         if (lastKeyDebug.isNotBlank()) {
             Text(
                 "Последняя кнопка: $lastKeyDebug",
