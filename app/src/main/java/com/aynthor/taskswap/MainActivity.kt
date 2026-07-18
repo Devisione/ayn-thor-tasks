@@ -42,6 +42,7 @@ import com.aynthor.taskswap.ui.SetupGuide
 import com.aynthor.taskswap.ui.SetupStatus
 import com.aynthor.taskswap.ui.StatusBanner
 import com.aynthor.taskswap.ui.ThorDisplaySwapperTheme
+import com.aynthor.taskswap.util.AccidentalHomeGuard
 import com.aynthor.taskswap.util.DeveloperSettingsChecker
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
@@ -91,6 +92,8 @@ fun MainScreen() {
     var connectionPort by remember { mutableStateOf(AdbConnectionManager.savedConnectionPort()?.toString() ?: "") }
 
     var gesturesEnabled by remember { mutableStateOf(GestureSettings.isEnabled(context)) }
+    var accidentalHomeGuard by remember { mutableStateOf(AccidentalHomeGuard.isEnabled(context)) }
+    var accidentalHomeGuardBusy by remember { mutableStateOf(false) }
     var gestureActions by remember {
         mutableStateOf(
             GestureSettings.Slot.entries.associateWith { GestureSettings.getAction(context, it) }
@@ -145,6 +148,9 @@ fun MainScreen() {
             lastKeyDebug = TaskSwapService.lastKeyDebug
             adbPaired = AdbConnectionManager.isPaired()
             wirelessDebuggingReady = DeveloperSettingsChecker.isDeveloperSetupReady(context)
+            if (!accidentalHomeGuardBusy) {
+                accidentalHomeGuard = AccidentalHomeGuard.isEnabled(context)
+            }
             val pm = context.getSystemService(PowerManager::class.java)
             batteryOptimized = !pm.isIgnoringBatteryOptimizations(context.packageName)
 
@@ -183,7 +189,7 @@ fun MainScreen() {
             style = MaterialTheme.typography.headlineSmall,
             color = MaterialTheme.colorScheme.onBackground
         )
-        Text("v1.2.0", style = MaterialTheme.typography.labelSmall)
+        Text("v2.0.0", style = MaterialTheme.typography.labelSmall)
         if (lastKeyDebug.isNotBlank()) {
             Text(
                 "Последняя кнопка: $lastKeyDebug",
@@ -283,6 +289,32 @@ fun MainScreen() {
                 onEnabledChange = { enabled ->
                     gesturesEnabled = enabled
                     GestureSettings.setEnabled(context, enabled)
+                },
+                accidentalHomeGuard = accidentalHomeGuard,
+                accidentalHomeGuardBusy = accidentalHomeGuardBusy,
+                onAccidentalHomeGuardChange = { enabled ->
+                    scope.launch {
+                        accidentalHomeGuardBusy = true
+                        accidentalHomeGuard = enabled
+                        val result = AccidentalHomeGuard.setEnabled(context, enabled)
+                        accidentalHomeGuard = AccidentalHomeGuard.isEnabled(context)
+                        accidentalHomeGuardBusy = false
+                        if (result.isSuccess) {
+                            showStatus(
+                                if (enabled) {
+                                    "Защита от случайного Home включена"
+                                } else {
+                                    "Защита выключена — Home с первого нажатия"
+                                },
+                                BannerType.SUCCESS
+                            )
+                        } else {
+                            showStatus(
+                                "Не удалось изменить настройку: ${result.exceptionOrNull()?.message}. Нужен ADB.",
+                                BannerType.ERROR
+                            )
+                        }
+                    }
                 },
                 actions = gestureActions,
                 onActionChange = { slot, action ->

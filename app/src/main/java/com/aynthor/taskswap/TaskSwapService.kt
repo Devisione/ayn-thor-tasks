@@ -9,7 +9,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.hardware.display.DisplayManager
-import android.provider.Settings
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -26,6 +25,7 @@ import android.view.accessibility.AccessibilityWindowInfo
 import androidx.core.app.NotificationCompat
 import com.aynthor.taskswap.adb.AdbConnectionManager
 import com.aynthor.taskswap.adb.ShellExecutor
+import com.aynthor.taskswap.input.AynGpioReplayGate
 import com.aynthor.taskswap.input.ButtonGestures
 import com.aynthor.taskswap.input.GestureSettings
 import com.aynthor.taskswap.input.ThorKeyMapper
@@ -34,6 +34,7 @@ import com.aynthor.taskswap.task.DisplaySwapper
 import com.aynthor.taskswap.task.DisplayTransferRules
 import com.aynthor.taskswap.task.ShellPackages
 import com.aynthor.taskswap.task.TaskResolver
+import com.aynthor.taskswap.util.AccidentalHomeGuard
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -180,14 +181,10 @@ class TaskSwapService : AccessibilityService() {
     }
 
     /**
-     * After short-AYN gpio replay, let the next DOWN+UP reach the system (native AYN menu)
-     * without re-entering gesture state. Must NOT swallow — that was why menu never opened.
+     * Short-AYN gpio replay gate: pass echoes to the system, never re-enter gestures.
+     * See [com.aynthor.taskswap.input.AynGpioReplayGate].
      */
-    @Volatile
-    private var remainingAynReplayPassThrough = 0
-
-    @Volatile
-    private var aynReplayUntilElapsed = 0L
+    private val aynReplayGate = AynGpioReplayGate()
 
     @Volatile
     private var cachedGpioEventNode: String? = null
@@ -231,34 +228,10 @@ class TaskSwapService : AccessibilityService() {
 
         scope.launch {
             AdbConnectionManager.reconnect()
-            disableOdinAccidentalHomeGuard()
+            AccidentalHomeGuard.applyPreferred(this@TaskSwapService)
         }
 
         Log.d(TAG, "Connected, displays: $availableDisplayIds")
-    }
-
-    /**
-     * Odin Game Assistant "Prevent pressing Home accidentally" swallows the first Home
-     * and shows "press home again to return to launcher". Disable so we can own Home.
-     */
-    private suspend fun disableOdinAccidentalHomeGuard() {
-        val key = "prevent_press_home_accidentally"
-        try {
-            val cur = Settings.System.getInt(contentResolver, key, 1)
-            if (cur != 0) {
-                val ok = Settings.System.putInt(contentResolver, key, 0)
-                Log.i(TAG, "Settings.System $key: $cur → 0 (put=$ok)")
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Cannot write $key via Settings: ${e.message}")
-        }
-        // ADB path — works without WRITE_SETTINGS when wireless ADB is up.
-        val shell = AdbConnectionManager.shell("settings put system $key 0")
-        if (shell.isSuccess) {
-            Log.i(TAG, "ADB disabled $key")
-        } else {
-            Log.w(TAG, "ADB disable $key: ${shell.exceptionOrNull()?.message}")
-        }
     }
 
     override fun onInterrupt() {}
@@ -357,11 +330,14 @@ class TaskSwapService : AccessibilityService() {
         }
 
         // --- normal gesture path ---
-        // gpio replay for short AYN: pass through to system, skip gesture re-entry.
-        if (shouldPassThroughAynReplay(event)) {
-            remainingAynReplayPassThrough = (remainingAynReplayPassThrough - 1).coerceAtLeast(0)
-            if (remainingAynReplayPassThrough == 0) aynReplayUntilElapsed = 0L
-            Log.d(TAG, "AYN replay pass-through (${remainingAynReplayPassThrough} left)")
+        // gpio replay echoes for short AYN: pass through to system, skip gesture re-entry.
+        if (aynReplayGate.shouldPassThrough(
+                event.keyCode,
+                event.device?.name,
+                SystemClock.elapsedRealtime()
+            )
+        ) {
+            Log.d(TAG, "AYN replay pass-through")
             return false
         }
 
@@ -522,7 +498,12 @@ class TaskSwapService : AccessibilityService() {
             performGlobalAction(GLOBAL_ACTION_HOME)
         }
         if (decision.scheduleAynGpioInject) {
-            scope.launch { injectGpioAynShort() }
+            val now = SystemClock.elapsedRealtime()
+            if (!aynReplayGate.shouldScheduleInject(now)) {
+                Log.d(TAG, "AYN short: skip inject (in-flight or cooldown)")
+            } else {
+                scope.launch { injectGpioAynShort() }
+            }
         }
         return ranCustom
     }
@@ -530,43 +511,40 @@ class TaskSwapService : AccessibilityService() {
     /**
      * Replay one gpio AYN tap so the vendor menu opens after we consumed the physical press.
      * Echoes must pass through (not be swallowed) — otherwise the menu never sees the key.
+     *
+     * Pass-through is armed *after* sendevent returns; during the ADB call [AynGpioReplayGate]
+     * treats matching events as in-flight echoes. Never arm a count *before* send — real taps
+     * used to steal those slots and late echoes re-armed inject forever.
      */
     private suspend fun injectGpioAynShort() {
-        val node = cachedGpioEventNode
-            ?: shellExecutor.findInputEventNode("gpio-keys")?.also { cachedGpioEventNode = it }
-        if (node == null) {
-            Log.w(TAG, "AYN short: gpio node not found (is wireless ADB connected?)")
+        val now0 = SystemClock.elapsedRealtime()
+        if (!aynReplayGate.tryBeginInject(now0)) {
+            Log.d(TAG, "AYN short: inject already active/cooldown")
             return
         }
-        remainingAynReplayPassThrough = 2
-        aynReplayUntilElapsed = SystemClock.elapsedRealtime() + 1_200L
-        val result = shellExecutor.sendeventKeyPulse(node, ThorKeyMapper.SCAN_AYN_F24)
-        if (result.isSuccess && result.getOrNull()?.success == true) {
-            Log.i(TAG, "AYN short: sendevent gpio pulse on $node")
-        } else {
-            remainingAynReplayPassThrough = 0
-            aynReplayUntilElapsed = 0L
-            Log.w(
-                TAG,
-                "AYN short: sendevent failed: ${result.exceptionOrNull()?.message ?: result.getOrNull()?.output}"
-            )
+        try {
+            val node = cachedGpioEventNode
+                ?: shellExecutor.findInputEventNode("gpio-keys")?.also { cachedGpioEventNode = it }
+            if (node == null) {
+                Log.w(TAG, "AYN short: gpio node not found (is wireless ADB connected?)")
+                aynReplayGate.abortInject(SystemClock.elapsedRealtime())
+                return
+            }
+            val result = shellExecutor.sendeventKeyPulse(node, ThorKeyMapper.SCAN_AYN_F24)
+            val ok = result.isSuccess && result.getOrNull()?.success == true
+            aynReplayGate.onInjectFinished(ok, SystemClock.elapsedRealtime())
+            if (ok) {
+                Log.i(TAG, "AYN short: sendevent gpio pulse on $node")
+            } else {
+                Log.w(
+                    TAG,
+                    "AYN short: sendevent failed: ${result.exceptionOrNull()?.message ?: result.getOrNull()?.output}"
+                )
+            }
+        } catch (e: Exception) {
+            aynReplayGate.abortInject(SystemClock.elapsedRealtime())
+            Log.w(TAG, "AYN short: inject exception: ${e.message}")
         }
-    }
-
-    private fun shouldPassThroughAynReplay(event: KeyEvent): Boolean {
-        if (remainingAynReplayPassThrough <= 0) return false
-        if (SystemClock.elapsedRealtime() >= aynReplayUntilElapsed) {
-            remainingAynReplayPassThrough = 0
-            return false
-        }
-        if (event.keyCode != KeyEvent.KEYCODE_HOME && event.keyCode != ThorKeyMapper.KEYCODE_F24) {
-            return false
-        }
-        val name = event.device?.name?.lowercase().orEmpty()
-        if (name.contains("odin") || name.contains("controller") || name.contains("gamepad")) {
-            return false
-        }
-        return true
     }
 
     /** Keep display awake when opening All Apps (safety net). */

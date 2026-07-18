@@ -31,6 +31,9 @@ import com.aynthor.taskswap.input.GestureSettings
 fun GestureSettingsPanel(
     enabled: Boolean,
     onEnabledChange: (Boolean) -> Unit,
+    accidentalHomeGuard: Boolean,
+    onAccidentalHomeGuardChange: (Boolean) -> Unit,
+    accidentalHomeGuardBusy: Boolean = false,
     actions: Map<GestureSettings.Slot, GestureSettings.CustomAction>,
     onActionChange: (GestureSettings.Slot, GestureSettings.CustomAction) -> Unit
 ) {
@@ -60,6 +63,30 @@ fun GestureSettingsPanel(
                     )
                 }
                 Switch(checked = enabled, onCheckedChange = onEnabledChange)
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                    Text(
+                        "Защита от случайного Home",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        "Как в Thor Settings: при включении Home нужно нажать дважды.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(
+                    checked = accidentalHomeGuard,
+                    onCheckedChange = onAccidentalHomeGuardChange,
+                    enabled = !accidentalHomeGuardBusy
+                )
             }
 
             if (enabled) {
