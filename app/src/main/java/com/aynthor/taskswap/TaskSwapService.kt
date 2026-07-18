@@ -5,8 +5,10 @@ import android.accessibilityservice.AccessibilityServiceInfo
 import android.app.ActivityOptions
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.hardware.display.DisplayManager
 import android.os.Build
@@ -39,6 +41,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 import java.util.concurrent.ConcurrentHashMap
 
 class TaskSwapService : AccessibilityService() {
@@ -189,6 +192,34 @@ class TaskSwapService : AccessibilityService() {
     @Volatile
     private var cachedGpioEventNode: String? = null
 
+    private var wakeReceiverRegistered = false
+
+    /**
+     * After lid close / screen off, wireless ADB dies while short-AYN still needs sendevent.
+     * Reconnect on wake and clear stuck inject state so the next short press works.
+     */
+    private val wakeReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> onScreenAwake()
+            }
+        }
+    }
+
+    private fun onScreenAwake() {
+        cachedGpioEventNode = null
+        aynReplayGate.abortInject(SystemClock.elapsedRealtime())
+        scope.launch {
+            // Always reconnect after sleep/lid — do not trust a stale CONNECTED flag.
+            val result = AdbConnectionManager.reconnect()
+            if (result.isSuccess) {
+                Log.i(TAG, "ADB reconnected after screen awake (short AYN)")
+            } else {
+                Log.w(TAG, "ADB after awake failed: ${result.exceptionOrNull()?.message}")
+            }
+        }
+    }
+
     private fun longRunnableFor(key: ButtonGestures.Key): Runnable = when (key) {
         ButtonGestures.Key.BACK -> backLongRunnable
         ButtonGestures.Key.HOME -> homeLongRunnable
@@ -225,6 +256,7 @@ class TaskSwapService : AccessibilityService() {
         detectLaunchers()
         postPersistentNotification()
         isRunning = true
+        registerWakeReceiver()
 
         scope.launch {
             AdbConnectionManager.reconnect()
@@ -234,11 +266,33 @@ class TaskSwapService : AccessibilityService() {
         Log.d(TAG, "Connected, displays: $availableDisplayIds")
     }
 
+    private fun registerWakeReceiver() {
+        if (wakeReceiverRegistered) return
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(wakeReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(wakeReceiver, filter)
+        }
+        wakeReceiverRegistered = true
+    }
+
+    private fun unregisterWakeReceiver() {
+        if (!wakeReceiverRegistered) return
+        runCatching { unregisterReceiver(wakeReceiver) }
+        wakeReceiverRegistered = false
+    }
+
     override fun onInterrupt() {}
 
     override fun onDestroy() {
         super.onDestroy()
         isRunning = false
+        unregisterWakeReceiver()
         getSystemService(NotificationManager::class.java)?.cancel(1)
         scope.launch { AdbConnectionManager.disconnect() }
     }
@@ -515,6 +569,10 @@ class TaskSwapService : AccessibilityService() {
      * Pass-through is armed *after* sendevent returns; during the ADB call [AynGpioReplayGate]
      * treats matching events as in-flight echoes. Never arm a count *before* send — real taps
      * used to steal those slots and late echoes re-armed inject forever.
+     *
+     * Always [AdbConnectionManager.ensureConnected] first: after lid/sleep the socket is often
+     * dead while state still says CONNECTED — without a ping, short AYN stays silent and long
+     * (Intent) still works.
      */
     private suspend fun injectGpioAynShort() {
         val now0 = SystemClock.elapsedRealtime()
@@ -523,28 +581,66 @@ class TaskSwapService : AccessibilityService() {
             return
         }
         try {
-            val node = cachedGpioEventNode
-                ?: shellExecutor.findInputEventNode("gpio-keys")?.also { cachedGpioEventNode = it }
-            if (node == null) {
-                Log.w(TAG, "AYN short: gpio node not found (is wireless ADB connected?)")
-                aynReplayGate.abortInject(SystemClock.elapsedRealtime())
-                return
-            }
-            val result = shellExecutor.sendeventKeyPulse(node, ThorKeyMapper.SCAN_AYN_F24)
-            val ok = result.isSuccess && result.getOrNull()?.success == true
-            aynReplayGate.onInjectFinished(ok, SystemClock.elapsedRealtime())
-            if (ok) {
-                Log.i(TAG, "AYN short: sendevent gpio pulse on $node")
-            } else {
-                Log.w(
-                    TAG,
-                    "AYN short: sendevent failed: ${result.exceptionOrNull()?.message ?: result.getOrNull()?.output}"
-                )
+            withTimeout(6_000L) {
+                val connected = AdbConnectionManager.ensureConnected()
+                if (connected.isFailure) {
+                    Log.w(
+                        TAG,
+                        "AYN short: ADB unavailable: ${connected.exceptionOrNull()?.message}"
+                    )
+                    aynReplayGate.abortInject(SystemClock.elapsedRealtime())
+                    return@withTimeout
+                }
+
+                var node = resolveGpioEventNode(forceRefresh = false)
+                if (node == null) {
+                    Log.w(TAG, "AYN short: gpio node not found, forcing ADB reconnect")
+                    AdbConnectionManager.reconnect()
+                    node = resolveGpioEventNode(forceRefresh = true)
+                }
+                if (node == null) {
+                    Log.w(TAG, "AYN short: gpio node not found (is wireless ADB connected?)")
+                    aynReplayGate.abortInject(SystemClock.elapsedRealtime())
+                    return@withTimeout
+                }
+
+                var result = shellExecutor.sendeventKeyPulse(node, ThorKeyMapper.SCAN_AYN_F24)
+                var ok = result.isSuccess && result.getOrNull()?.success == true
+                if (!ok) {
+                    Log.w(TAG, "AYN short: sendevent failed, retry after reconnect")
+                    cachedGpioEventNode = null
+                    AdbConnectionManager.reconnect()
+                    node = resolveGpioEventNode(forceRefresh = true)
+                    if (node != null) {
+                        result = shellExecutor.sendeventKeyPulse(node, ThorKeyMapper.SCAN_AYN_F24)
+                        ok = result.isSuccess && result.getOrNull()?.success == true
+                    }
+                }
+
+                aynReplayGate.onInjectFinished(ok, SystemClock.elapsedRealtime())
+                if (ok) {
+                    Log.i(TAG, "AYN short: sendevent gpio pulse on $node")
+                } else {
+                    Log.w(
+                        TAG,
+                        "AYN short: sendevent failed: ${result.exceptionOrNull()?.message ?: result.getOrNull()?.output}"
+                    )
+                }
             }
         } catch (e: Exception) {
+            cachedGpioEventNode = null
             aynReplayGate.abortInject(SystemClock.elapsedRealtime())
             Log.w(TAG, "AYN short: inject exception: ${e.message}")
         }
+    }
+
+    private suspend fun resolveGpioEventNode(forceRefresh: Boolean): String? {
+        if (!forceRefresh) {
+            cachedGpioEventNode?.let { return it }
+        } else {
+            cachedGpioEventNode = null
+        }
+        return shellExecutor.findInputEventNode("gpio-keys")?.also { cachedGpioEventNode = it }
     }
 
     /** Keep display awake when opening All Apps (safety net). */

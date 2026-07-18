@@ -12,8 +12,8 @@ android {
         applicationId = "com.aynthor.taskswap"
         minSdk = 30
         targetSdk = 34
-        versionCode = 4
-        versionName = "2.0.0"
+        versionCode = 5
+        versionName = "2.0.1"
     }
 
     buildTypes {

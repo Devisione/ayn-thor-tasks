@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import java.util.Base64
 
 data class ShellResult(
@@ -28,6 +29,13 @@ object AdbConnectionManager {
     private const val KEY_PAIRED = "paired"
     private const val KEY_CERT = "cert_b64"
     private const val KEY_KEY = "key_b64"
+    /** Dead wireless ADB after sleep/lid often hangs forever without a timeout. */
+    private const val SHELL_TIMEOUT_MS = 4_000L
+    /**
+     * Skip the live ping if a shell succeeded recently. After lid/sleep the wake
+     * receiver reconnects; otherwise a stale CONNECTED flag is caught by the ping.
+     */
+    private const val LIVE_SHELL_TRUST_MS = 20_000L
 
     enum class State {
         DISCONNECTED,
@@ -40,6 +48,8 @@ object AdbConnectionManager {
     private var kadb: Kadb? = null
     private var prefs: android.content.SharedPreferences? = null
     private var appContext: Context? = null
+    @Volatile
+    private var lastLiveShellAtMs: Long = 0L
 
     private val _state = MutableStateFlow(State.DISCONNECTED)
     val state: StateFlow<State> = _state.asStateFlow()
@@ -181,7 +191,7 @@ object AdbConnectionManager {
                     disconnectLocked()
                     Log.d(TAG, "Connecting on port $connectionPort")
                     val client = Kadb.create("127.0.0.1", connectionPort)
-                    val test = client.shell("echo ok")
+                    val test = withTimeout(SHELL_TIMEOUT_MS) { client.shell("echo ok") }
                     check(test.exitCode == 0) { "Shell test failed: ${test.output}" }
                     kadb = client
                     prefs?.edit()
@@ -190,6 +200,7 @@ object AdbConnectionManager {
                         ?.commit()
                     persistBackup()
                     _state.value = State.CONNECTED
+                    lastLiveShellAtMs = System.currentTimeMillis()
                     Log.i(TAG, "Connected on port $connectionPort")
                     Unit
                 }.onFailure {
@@ -207,19 +218,52 @@ object AdbConnectionManager {
         return connect(port)
     }
 
+    /**
+     * Ensures a live shell. After lid close / sleep the Kadb socket often dies while
+     * [State.CONNECTED] stays set — a ping detects that and forces reconnect.
+     * Short-AYN gpio replay depends on this; long-AYN (Intent) does not.
+     */
     suspend fun ensureConnected(): Result<Unit> {
         if (_state.value == State.CONNECTED && kadb != null) {
-            return Result.success(Unit)
+            val trustUntil = lastLiveShellAtMs + LIVE_SHELL_TRUST_MS
+            if (System.currentTimeMillis() < trustUntil) {
+                return Result.success(Unit)
+            }
+            val ping = shellOnce("echo ok")
+            if (ping.isSuccess && ping.getOrNull()?.success == true) {
+                return Result.success(Unit)
+            }
+            Log.w(TAG, "Stale ADB connection (ping failed) — reconnecting")
         }
         return reconnect()
     }
 
-    suspend fun shell(command: String): Result<ShellResult> = withContext(Dispatchers.IO) {
+    /**
+     * Run a shell command. On transport failure, drop the dead client and retry once
+     * after [reconnect] (covers post-sleep stale sockets).
+     */
+    suspend fun shell(command: String): Result<ShellResult> {
+        val first = shellOnce(command)
+        if (first.isSuccess) return first
+        Log.w(TAG, "Shell transport failed, reconnect+retry: ${first.exceptionOrNull()?.message}")
+        val re = reconnect()
+        if (re.isFailure) return first
+        return shellOnce(command)
+    }
+
+    private suspend fun shellOnce(command: String): Result<ShellResult> = withContext(Dispatchers.IO) {
         mutex.withLock {
             runCatching {
                 val client = kadb ?: error("ADB не подключён")
-                val response = client.shell(command)
-                ShellResult(response.exitCode, response.output.trim())
+                withTimeout(SHELL_TIMEOUT_MS) {
+                    val response = client.shell(command)
+                    ShellResult(response.exitCode, response.output.trim())
+                }
+            }.onSuccess {
+                lastLiveShellAtMs = System.currentTimeMillis()
+            }.onFailure { e ->
+                Log.w(TAG, "Shell failed, dropping client: ${e.message}")
+                disconnectLocked()
             }
         }
     }
@@ -235,6 +279,7 @@ object AdbConnectionManager {
             Log.w(TAG, "Error closing Kadb: ${e.message}")
         }
         kadb = null
+        lastLiveShellAtMs = 0L
         if (_state.value != State.PAIRING_REQUIRED) {
             _state.value = State.DISCONNECTED
         }

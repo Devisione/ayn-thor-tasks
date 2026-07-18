@@ -60,6 +60,18 @@ class AynGpioReplayGateTest {
     }
 
     @Test
+    fun abortInject_clearsInFlight_soNextShortCanRun() {
+        val gate = AynGpioReplayGate(reentryCooldownMs = 0L)
+        assertTrue(gate.tryBeginInject(0L))
+        assertTrue(gate.isInjectInFlight())
+        // Lid/sleep path: wake receiver aborts a hung inject so short AYN works again.
+        gate.abortInject(50L)
+        assertFalse(gate.isInjectInFlight())
+        assertTrue(gate.tryBeginInject(60L))
+        gate.abortInject(70L)
+    }
+
+    @Test
     fun odinControllerHome_neverPassThrough() {
         val gate = AynGpioReplayGate()
         assertTrue(gate.tryBeginInject(0L))
