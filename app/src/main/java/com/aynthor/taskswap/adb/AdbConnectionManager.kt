@@ -219,6 +219,14 @@ object AdbConnectionManager {
     }
 
     /**
+     * Drop the recent-shell trust window (e.g. after lid close / screen off).
+     * Next [ensureConnected] must ping or reconnect instead of assuming the socket is live.
+     */
+    fun invalidateLiveShellTrust() {
+        lastLiveShellAtMs = 0L
+    }
+
+    /**
      * Ensures a live shell. After lid close / sleep the Kadb socket often dies while
      * [State.CONNECTED] stays set — a ping detects that and forces reconnect.
      * Short-AYN gpio replay depends on this; long-AYN (Intent) does not.

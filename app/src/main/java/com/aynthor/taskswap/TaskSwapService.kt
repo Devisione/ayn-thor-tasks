@@ -183,6 +183,16 @@ class TaskSwapService : AccessibilityService() {
         applyDecision(gestures.onBackSingleTapTimeout())
     }
 
+    /** Cooldown / in-flight overlap — replay gpio once gate opens (physical UP already consumed). */
+    private val aynInjectRetryRunnable = Runnable {
+        val now = SystemClock.elapsedRealtime()
+        if (aynReplayGate.tryBeginInject(now)) {
+            scope.launch { runAynGpioInject() }
+        } else {
+            Log.d(TAG, "AYN short: retry still blocked")
+        }
+    }
+
     /**
      * Short-AYN gpio replay gate: pass echoes to the system, never re-enter gestures.
      * See [com.aynthor.taskswap.input.AynGpioReplayGate].
@@ -201,14 +211,24 @@ class TaskSwapService : AccessibilityService() {
     private val wakeReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> onScreenOff()
                 Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> onScreenAwake()
             }
         }
     }
 
+    private fun onScreenOff() {
+        cachedGpioEventNode = null
+        AdbConnectionManager.invalidateLiveShellTrust()
+        aynReplayGate.abortInject(SystemClock.elapsedRealtime())
+        handler.removeCallbacks(aynInjectRetryRunnable)
+    }
+
     private fun onScreenAwake() {
         cachedGpioEventNode = null
+        AdbConnectionManager.invalidateLiveShellTrust()
         aynReplayGate.abortInject(SystemClock.elapsedRealtime())
+        handler.removeCallbacks(aynInjectRetryRunnable)
         scope.launch {
             // Always reconnect after sleep/lid — do not trust a stale CONNECTED flag.
             val result = AdbConnectionManager.reconnect()
@@ -269,6 +289,7 @@ class TaskSwapService : AccessibilityService() {
     private fun registerWakeReceiver() {
         if (wakeReceiverRegistered) return
         val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
             addAction(Intent.ACTION_SCREEN_ON)
             addAction(Intent.ACTION_USER_PRESENT)
         }
@@ -292,6 +313,7 @@ class TaskSwapService : AccessibilityService() {
     override fun onDestroy() {
         super.onDestroy()
         isRunning = false
+        handler.removeCallbacks(aynInjectRetryRunnable)
         unregisterWakeReceiver()
         getSystemService(NotificationManager::class.java)?.cancel(1)
         scope.launch { AdbConnectionManager.disconnect() }
@@ -552,14 +574,22 @@ class TaskSwapService : AccessibilityService() {
             performGlobalAction(GLOBAL_ACTION_HOME)
         }
         if (decision.scheduleAynGpioInject) {
+            handler.removeCallbacks(aynInjectRetryRunnable)
             val now = SystemClock.elapsedRealtime()
-            if (!aynReplayGate.shouldScheduleInject(now)) {
-                Log.d(TAG, "AYN short: skip inject (in-flight or cooldown)")
+            // Arm inFlight on the key thread so a fast second tap pass-through covers slow ADB.
+            if (aynReplayGate.tryBeginInject(now)) {
+                scope.launch { runAynGpioInject() }
             } else {
-                scope.launch { injectGpioAynShort() }
+                Log.d(TAG, "AYN short: defer inject (in-flight or cooldown)")
+                scheduleAynInjectRetry()
             }
         }
         return ranCustom
+    }
+
+    private fun scheduleAynInjectRetry() {
+        handler.removeCallbacks(aynInjectRetryRunnable)
+        handler.postDelayed(aynInjectRetryRunnable, 180L)
     }
 
     /**
@@ -570,16 +600,13 @@ class TaskSwapService : AccessibilityService() {
      * treats matching events as in-flight echoes. Never arm a count *before* send — real taps
      * used to steal those slots and late echoes re-armed inject forever.
      *
+     * Caller must have already called [AynGpioReplayGate.tryBeginInject] on the key thread.
+     *
      * Always [AdbConnectionManager.ensureConnected] first: after lid/sleep the socket is often
      * dead while state still says CONNECTED — without a ping, short AYN stays silent and long
      * (Intent) still works.
      */
-    private suspend fun injectGpioAynShort() {
-        val now0 = SystemClock.elapsedRealtime()
-        if (!aynReplayGate.tryBeginInject(now0)) {
-            Log.d(TAG, "AYN short: inject already active/cooldown")
-            return
-        }
+    private suspend fun runAynGpioInject() {
         try {
             withTimeout(6_000L) {
                 val connected = AdbConnectionManager.ensureConnected()
